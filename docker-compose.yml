@@ -1,0 +1,22 @@
+services:
+  automata-cv:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    privileged: true
+    network_mode: host
+    volumes:
+      - .:/home/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /dev:/dev
+    environment:
+      - DISPLAY=$DISPLAY  # needed to show results on screen
+      - XAUTHORITY=$XAUTHORITY  # needed to show results on screen
+    command: python3 object_extraction.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
