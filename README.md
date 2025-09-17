@@ -10,17 +10,17 @@ The Automata Object Detection project is a deep learning-based system that uses 
 
 To install the project, follow these steps:
 
-1. Clone the repository: `git clone https://github.com/your-username/automata-object-detection.git`
-2. Navigate to the project directory: `cd automata-object-detection`
-3. Install the dependencies: `pip install -r requirements.txt`
+1. Clone the repository: `git clone --recurse-submodules https://github.com/GDqbrobotics/automata_object_detection-.git`
+2. Navigate to the project directory: `cd automata_object_detection-`
+3. Build the Docker image: `docker compose build`
 
 ## Usage
 
 To use the project, follow these steps:
 
-1. Prepare your test images: Place the images you want to analyze in a directory named `test_images`.
-2. Run the object detection script: `python object_detection.py`
-The script will process each image in the `test_images` directory and display the detected objects with their corresponding labels.
+1. Connect a realsense camera d415 to your computer.
+2. Run the object detection script inside the Docker container: `docker compose up` (you don't need to build if  you just change the object_extraction.py file)
+The script will process each frame from the camera and save the results to a result.png.
 
 ## Contributing
 
@@ -34,12 +34,12 @@ Contributions are welcome! If you find a bug or have a feature request, please o
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the [...] License.
 
 ## Acknowledgements
 
-The Automata Object Detection project is part of the European Project Automata. We would like to express our gratitude to the project partners and contributors for their support and collaboration.
+The Automata Object Detection project is part of the European Project Automata.
 
 ## Contact
 
-If you have any questions or need further assistance, please contact [your email address].
+If you have any questions or need further assistance, please contact giuliano.dami@qbrobotics.com.
