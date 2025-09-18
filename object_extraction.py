@@ -8,7 +8,7 @@ import time
 import cv2
 import numpy as np
 import argparse 
-#import json
+import json
 #import paho.mqtt.client as mqtt
 from multiprocessing import Process, Queue
 from PIL import ImageOps
@@ -187,10 +187,7 @@ def inference(*, frame_queue, verbose=False, sleep=0, depth_height=720, depth_wi
         if verbose: print("[INFERENCE] Inference on image of size", base_image.size)
 
         # Visualization
-        # plt.axis("off")
-        # plt.imshow(extract_object(birefnet, imagepath='ceramic.jpg')[0])
-        # plt.show()
-
+        cv2.imwrite('debug_bkgrnd.png', frame)
 
         # Step 1: Load and preprocess the image
         # image = Image.open('ceramic_out.png')
@@ -204,6 +201,9 @@ def inference(*, frame_queue, verbose=False, sleep=0, depth_height=720, depth_wi
         cv2.imwrite('debug.png', image)
         contours, hierarchy = cv2.findContours(thresholded, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
         image[:, :] = [255, 255, 255, 255]
+        
+        results = []
+        
         for contour in contours:
             if contour.size < 500 or contour.size > 3000:
                 continue
@@ -215,10 +215,64 @@ def inference(*, frame_queue, verbose=False, sleep=0, depth_height=720, depth_wi
                 cv2.drawContours(image, [contour], -1, (255, 0, 0),10)
                 cv2.circle(image, (cx, cy), 5, (255, 0, 0), 3)
 
+                x1,y1,x2,y2 = findMinSegment(cx,cy,contour)
+                result = {'1': (x1, y1), '2': (x2, y2)}
+                results.append(result)
+
         cv2.imwrite('result.png', image)
-        
+
         if sleep > 0:
             time.sleep(sleep)
+
+def findMinSegment(x, y, contour):
+    ## AI Generated s***t to find min segment. Probably nonsense
+    min_dist = 100000
+    min_x1 = 0
+    min_y1 = 0
+    min_x2 = 0
+    min_y2 = 0
+    for i in range(len(contour)):
+        dist = np.sqrt((contour[i][0][0] - x)**2 + (contour[i][0][1] - y)**2)
+        if dist < min_dist:
+            min_dist = dist
+            min_x1 = contour[i][0][0]
+            min_y1 = contour[i][0][1]
+            min_x2 = contour[(i+1) % len(contour)][0][0]
+            min_y2 = contour[(i+1) % len(contour)][0][1]
+    return min_x1, min_y1, min_x2, min_y2   
+
+def pixel2pose(results,depth, coeff_height, coeff_width):    
+    message = []
+    cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
+    i=0
+    for result in results:
+        _y1,_x1 = cropper.cropped2orig(result['1'][1], result['1'][0])
+        _x1 = _x1 * coeff_width
+        _y1 = _y1 * coeff_height
+        _z1 = depth[int(_y1), int(_x1)].item()
+
+        z1, x1, y1 = convert_depth_to_phys_coord_using_realsense(_x1, _y1, _z1)
+
+        _y2,_x2 = cropper.cropped2orig(result['2'][1], result['2'][0])
+        _x2 = _x2 * coeff_width
+        _y2 = _y2 * coeff_height
+        _z2 = depth[int(_y2), int(_x2)].item()
+
+        z2, x2, y2 = convert_depth_to_phys_coord_using_realsense(_x2, _y2, _z2)
+
+        if z != 0: #check for possible occlusion on the depth image
+            message.append({
+                "Object number": i,
+                "x_1": x1,
+                "y_1": y1,
+                "z_1": z1,
+                "x_2": x2,
+                "y_2": y2,
+                "z_2": z2
+            })            
+            i+=1
+
+    return message
 
 
 
