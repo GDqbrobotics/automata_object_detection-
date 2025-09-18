@@ -106,9 +106,9 @@ def read_camera(*, frame_queue, width, height, verbose=False):
     print("Depth Scale is: " , depth_scale)
     
     s = profile.get_device().query_sensors()[1]
-    s.set_option(rs.option.saturation, 65)
+    s.set_option(rs.option.saturation, 70)
     s.set_option(rs.option.contrast, 65)
-    s.set_option(rs.option.exposure, 38)
+    s.set_option(rs.option.exposure, 45)
 
     clipping_distance_in_meters = 1
     clipping_distance = clipping_distance_in_meters / depth_scale
@@ -189,21 +189,26 @@ def inference(*, frame_queue, verbose=False, sleep=0, depth_height=720, depth_wi
         # Visualization
         cv2.imwrite('debug_bkgrnd.png', frame)
 
+        base_image1 = np.array(base_image.convert('RGBA'))
+        base_image1 = cv2.cvtColor(base_image1, cv2.COLOR_RGBA2BGRA)
+
         # Step 1: Load and preprocess the image
         # image = Image.open('ceramic_out.png')
         image = extract_object(birefnet, base_image)[0]
         image = np.array(image.convert('RGBA'))
         image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGRA)
 
+
         # Step 2: Thresholding to separate the object from the background
         _, thresholded = cv2.threshold(image[:, :, 3], 254, 255, cv2.THRESH_BINARY_INV)
 
         cv2.imwrite('debug.png', image)
-        contours, hierarchy = cv2.findContours(thresholded, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-        image[:, :] = [255, 255, 255, 255]
-        
+        contours, hierarchy = cv2.findContours(thresholded, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE) #CHAIN_APPROX_SIMPLE
+
         results = []
-        
+
+        canvas = np.ones_like(image, dtype=np.uint8) * 255  # bianco
+
         for contour in contours:
             if contour.size < 500 or contour.size > 3000:
                 continue
@@ -212,34 +217,83 @@ def inference(*, frame_queue, verbose=False, sleep=0, depth_height=720, depth_wi
             if m00 != 0:
                 cx = int(M['m10']/m00)
                 cy = int(M['m01']/m00)
-                cv2.drawContours(image, [contour], -1, (255, 0, 0),10)
-                cv2.circle(image, (cx, cy), 5, (255, 0, 0), 3)
 
-                x1,y1,x2,y2 = findMinSegment(cx,cy,contour)
-                result = {'1': (x1, y1), '2': (x2, y2)}
+                cv2.drawContours(base_image1, [contour], -1, (255, 0, 0, 255), 2)   # rosso
+                cv2.circle(base_image1, (cx, cy), 6, (0, 255, 0, 255), 2)          # verde
+
+
+                segment_p1, segment_p2 = findMinSegment(cx, cy, contour)
+
+                cv2.line(base_image1, segment_p1, segment_p2, (0, 255, 0), 2)
+                cv2.circle(base_image1, segment_p1, 7, (0, 255, 255), -1)
+                cv2.circle(base_image1, segment_p2, 7, (0, 255, 255), -1)
+
+                result = {'1': segment_p1, '2': segment_p2}
                 results.append(result)
 
-        cv2.imwrite('result.png', image)
+        cv2.imwrite("result.png", base_image1)
 
         if sleep > 0:
             time.sleep(sleep)
 
-def findMinSegment(x, y, contour):
-    ## AI Generated s***t to find min segment. Probably nonsense
-    min_dist = 100000
-    min_x1 = 0
-    min_y1 = 0
-    min_x2 = 0
-    min_y2 = 0
-    for i in range(len(contour)):
-        dist = np.sqrt((contour[i][0][0] - x)**2 + (contour[i][0][1] - y)**2)
-        if dist < min_dist:
-            min_dist = dist
-            min_x1 = contour[i][0][0]
-            min_y1 = contour[i][0][1]
-            min_x2 = contour[(i+1) % len(contour)][0][0]
-            min_y2 = contour[(i+1) % len(contour)][0][1]
-    return min_x1, min_y1, min_x2, min_y2   
+def findMinSegment(cx, cy, contour):
+
+    contour = contour.squeeze(axis=1) # converto contorno da (N, 1, 2) a (N, 2) per facilitare i calcoli
+
+    # 1. Traduci i punti del contorno in modo che il centroide sia all'origine (0,0).
+    translated_contour = contour - [cx, cy]
+
+    # 2. Calcola l'angolo di ogni punto rispetto al centroide.
+    # np.arctan2 restituisce l'angolo in radianti nell'intervallo [-pi, pi].
+    angles = np.arctan2(translated_contour[:, 1], translated_contour[:, 0])
+
+    # 3. Ordina i punti del contorno in base al loro angolo.
+    sorted_indices = np.argsort(angles)
+    sorted_points = contour[sorted_indices]
+    sorted_angles = angles[sorted_indices]
+
+    min_dist_sq = float('inf')
+    result_points = (None, None)
+
+    # 4. Per ogni punto, trova il suo punto "opposto" più vicino usando la ricerca binaria.
+    num_points = len(sorted_points)
+    for i in range(num_points):
+        p1 = sorted_points[i]
+        angle1 = sorted_angles[i]
+
+        # L'angolo opposto è sfasato di 180 gradi (pi radianti).
+        target_angle = angle1 + np.pi
+        # Normalizza l'angolo target per rimanere nell'intervallo [-pi, pi].
+        if target_angle > np.pi:
+            target_angle -= 2 * np.pi
+
+        # 5. Usa np.searchsorted (ricerca binaria) per trovare l'indice del punto
+        # con l'angolo più vicino a quello target.
+        # Questo è molto più veloce di un ciclo annidato (O(log N) invece di O(N)).
+        idx = np.searchsorted(sorted_angles, target_angle)
+
+        # La ricerca binaria ci dà un punto di inserimento. Il punto opposto più vicino
+        # sarà in questa posizione o in quella precedente. Controlliamo entrambe.
+        # Usiamo il modulo (%) per gestire il "wrap-around" dell'array circolare di angoli.
+        idx1 = idx % num_points
+        idx2 = (idx - 1 + num_points) % num_points
+
+        # Calcola la differenza angolare effettiva per entrambi i candidati.
+        diff1 = np.abs(target_angle - sorted_angles[idx1])
+        diff2 = np.abs(target_angle - sorted_angles[idx2])
+        
+        # Scegli il punto con la minima differenza angolare.
+        best_idx = idx1 if diff1 < diff2 else idx2
+        p2 = sorted_points[best_idx]
+
+        # 6. Calcola la distanza e aggiorna il minimo se necessario.
+        # Usare la distanza al quadrato è più veloce perché evita la radice quadrata.
+        dist_sq = (p1[0] - p2[0])**2 + (p1[1] - p2[1])**2
+        if dist_sq < min_dist_sq:
+            min_dist_sq = dist_sq
+            result_points = (tuple(p1), tuple(p2))
+
+    return result_points
 
 def pixel2pose(results,depth, coeff_height, coeff_width):    
     message = []
@@ -260,7 +314,7 @@ def pixel2pose(results,depth, coeff_height, coeff_width):
 
         z2, x2, y2 = convert_depth_to_phys_coord_using_realsense(_x2, _y2, _z2)
 
-        if z != 0: #check for possible occlusion on the depth image
+        if z1*z2 != 0: #check for possible occlusion on the depth image
             message.append({
                 "Object number": i,
                 "x_1": x1,
@@ -273,8 +327,6 @@ def pixel2pose(results,depth, coeff_height, coeff_width):
             i+=1
 
     return message
-
-
 
 def main():
     parser = argparse.ArgumentParser()
