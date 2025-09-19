@@ -1,4 +1,13 @@
 services:
+  mqtt:
+    image: eclipse-mosquitto:latest
+    ports:
+      - 1883:1883
+      - 9001:9001
+      - 8080:8080
+    volumes:
+      - ./mqtt/mosquitto-config:/mosquitto/config/
+      - ./mqtt/auth:/auth 
   automata-cv:
     build:
       context: .

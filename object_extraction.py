@@ -3,13 +3,13 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import torch
 from torchvision import transforms
-
+import socket
 import time
 import cv2
 import numpy as np
 import argparse 
 import json
-#import paho.mqtt.client as mqtt
+import paho.mqtt.client as mqtt
 from multiprocessing import Process, Queue
 from PIL import ImageOps
 import sys
@@ -162,7 +162,7 @@ def extract_object(birefnet, image):
     image.putalpha(mask)
     return image, mask
 
-def inference(*, frame_queue, verbose=False, sleep=0, depth_height=720, depth_width=1280):
+def inference(*, frame_queue, send_queue, verbose=False, sleep=0, depth_height=720, depth_width=1280):
     
     # Load weights from Hugging Face Models
     birefnet = BiRefNet.from_pretrained('ZhengPeng7/BiRefNet')
@@ -231,6 +231,9 @@ def inference(*, frame_queue, verbose=False, sleep=0, depth_height=720, depth_wi
                 result = {'1': segment_p1, '2': segment_p2}
                 results.append(result)
 
+        message = pixel2pose(results, depth, coeff_height, coeff_width)
+        if len(message) > 0:
+            send_queue.put(message)
         cv2.imwrite("result.png", base_image1)
 
         if sleep > 0:
@@ -328,6 +331,24 @@ def pixel2pose(results,depth, coeff_height, coeff_width):
 
     return message
 
+def send(*, topic, topic_single, host, port, send_queue, username="", password="", verbose=False):
+    def on_connect(client, userdata, flags, rc):
+        print("[SEND] Connected to MQTT broker with result code "+str(rc))
+
+    client = mqtt.Client()
+    if len(username) > 0 or len(password) > 0:
+        print("Setting username and password")
+        client.username_pw_set(username, password)
+    
+    client.connect(host, port, 60)
+    client.on_connect = on_connect
+    client.loop_start()
+
+    while True:
+        event = send_queue.get()
+        if verbose: print("[SEND] Sending event: ", event)
+        client.publish(topic, json.dumps(event))
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -345,47 +366,47 @@ def main():
         help="Height of the stream"
     )
 
-    # parser.add_argument(
-    #     "--mqtt-host",
-    #     type=str,
-    #     default="192.168.139.70",
-    #     help="Host of the MQTT broker"
-    # )
+    parser.add_argument(
+        "--mqtt-host",
+        type=str,
+        default="192.168.139.70",
+        help="Host of the MQTT broker"
+    )
     
-    # parser.add_argument(
-    #     "--mqtt-port",
-    #     type=int,
-    #     default=1883,
-    #     help="Port of the MQTT broker"
-    # )
+    parser.add_argument(
+        "--mqtt-port",
+        type=int,
+        default=1883,
+        help="Port of the MQTT broker"
+    )
     
-    # parser.add_argument(
-    #     "--mqtt-user",
-    #     type=str,
-    #     default="mqtt",
-    #     help="MQTT username"
-    # )
+    parser.add_argument(
+        "--mqtt-user",
+        type=str,
+        default="mqtt",
+        help="MQTT username"
+    )
 
-    # parser.add_argument(
-    #     "--mqtt-password",
-    #     type=str,
-    #     default="Vn370gi@lo#T",
-    #     help="MQTT password"
-    # )
+    parser.add_argument(
+        "--mqtt-password",
+        type=str,
+        default="Vn370gi@lo#T",
+        help="MQTT password"
+    )
 
-    # parser.add_argument(
-    #     "--mqtt-send-topic",
-    #     type=str,
-    #     default="test_coordinate",
-    #     help="MQTT topic to publish events to"
-    # )
+    parser.add_argument(
+        "--mqtt-send-topic",
+        type=str,
+        default="test_coordinate",
+        help="MQTT topic to publish events to"
+    )
 
-    # parser.add_argument(
-    #     "--mqtt-send-topic-single",
-    #     type=str,
-    #     default="test_coordinate_single",
-    #     help="MQTT topic to publish events to (single)"
-    # )
+    parser.add_argument(
+        "--mqtt-send-topic-single",
+        type=str,
+        default="test_coordinate_single",
+        help="MQTT topic to publish events to (single)"
+    )
 
     parser.add_argument(
         "--inference-sleep",
@@ -415,35 +436,36 @@ def main():
         )
     )
 
-    # send_process = Process(
-    #     target=send,
-    #     kwargs=dict(
-    #         topic=args.mqtt_send_topic,
-    #         topic_single=args.mqtt_send_topic_single,
-    #         host=args.mqtt_host,
-    #         port=args.mqtt_port,
-    #         send_queue=send_queue,
-    #         username=args.mqtt_user,
-    #         password=args.mqtt_password,
-    #         verbose=args.verbose,
-    #     )
-    # )
+    send_process = Process(
+        target=send,
+        kwargs=dict(
+            topic=args.mqtt_send_topic,
+            topic_single=args.mqtt_send_topic_single,
+            host=args.mqtt_host,
+            port=args.mqtt_port,
+            send_queue=send_queue,
+            username=args.mqtt_user,
+            password=args.mqtt_password,
+            verbose=args.verbose,
+        )
+    )
 
     inference_process = Process(
         target=inference,
         kwargs=dict(
             frame_queue=frame_queue,
+            send_queue=send_queue,
             verbose=args.verbose,
             sleep=args.inference_sleep,
         )
     )
 
     read_process.start()
-    # send_process.start()
+    send_process.start()
     inference_process.start()
 
     inference_process.join()
-    # send_process.terminate()
+    send_process.terminate()
     read_process.terminate()
 
 
