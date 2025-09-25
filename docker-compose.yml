@@ -18,6 +18,9 @@ services:
       - .:/home/workspace
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /dev:/dev
+    device_cgroup_rules:
+      - 'c 81:* rmw'
+      - 'c 189:* rmw'
     environment:
       - DISPLAY=$DISPLAY  # needed to show results on screen
       - XAUTHORITY=$XAUTHORITY  # needed to show results on screen

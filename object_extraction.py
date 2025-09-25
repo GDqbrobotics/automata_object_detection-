@@ -116,8 +116,20 @@ def read_camera(*, frame_queue, width, height, verbose=False):
     align_to = rs.stream.color
     align = rs.align(align_to)
 
+    stale_frame_count = 0
+    last_color_image = np.array([])
+    
     while True:
-        frames = pipeline.wait_for_frames()
+        try:
+            frames = pipeline.wait_for_frames(timeout_ms=5000)
+
+        except:
+            print("DETECTED STALE FRAME CONDITION - RESETTING CAMERA")
+            pipeline.stop()
+            time.sleep(1)
+            pipeline.start(config)
+            continue
+
         aligned_frames = align.process(frames)
 
         aligned_depth_frame = aligned_frames.get_depth_frame()
@@ -128,6 +140,21 @@ def read_camera(*, frame_queue, width, height, verbose=False):
 
         depth_image = np.asanyarray(aligned_depth_frame.get_data())
         color_image = np.asanyarray(color_frame.get_data())
+        
+        # Check if frame is stale (timestamp hasn't changed)
+        if np.array_equal(last_color_image, color_image):
+            stale_frame_count += 1
+            if stale_frame_count > 5:  # 5 consecutive stale frames
+                print("DETECTED STALE FRAME CONDITION - RESETTING CAMERA")
+                pipeline.stop()
+                time.sleep(1)
+                pipeline.start(config)
+                stale_frame_count = 0
+                continue
+        else:
+            stale_frame_count = 0
+            last_color_image = color_image
+
         color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
 
         if verbose: print("[STREAM] Read rgb frame of size", color_image.shape)
@@ -139,6 +166,9 @@ def read_camera(*, frame_queue, width, height, verbose=False):
         
         if not frame_queue.full():
             frame_queue.put((color_image, depth_image))
+        
+        frames = None  # This helps Python's garbage collector
+        aligned_frames = None
 
 
 def extract_object(birefnet, image):
@@ -173,6 +203,10 @@ def inference(*, frame_queue, send_queue, verbose=False, sleep=0, depth_height=7
     print("[INFERENCE] Loaded model")
 
     while True:
+        if frame_queue.empty():
+            time.sleep(sleep)
+            continue
+
         frame, depth = frame_queue.get()
         # print("[INFERENCE] Inference on frame of size", frame.shape)
         # print("[INFERENCE] Inference on depth of size", depth.shape)
@@ -187,14 +221,28 @@ def inference(*, frame_queue, send_queue, verbose=False, sleep=0, depth_height=7
         if verbose: print("[INFERENCE] Inference on image of size", base_image.size)
 
         # Visualization
-        cv2.imwrite('debug_bkgrnd.png', frame)
+        # cv2.imwrite('debug_bkgrnd.png', frame)
 
         base_image1 = np.array(base_image.convert('RGBA'))
         base_image1 = cv2.cvtColor(base_image1, cv2.COLOR_RGBA2BGRA)
 
         # Step 1: Load and preprocess the image
-        # image = Image.open('ceramic_out.png')
+        
+        calculate_time = False #print execution time
+        if calculate_time:
+            start_time = time.time()
+        
         image = extract_object(birefnet, base_image)[0]
+        
+        if calculate_time:
+            end_time = time.time()
+
+            # Calculate the execution time
+            execution_time = end_time - start_time
+
+            # Print the execution time
+            print(f"Execution time: {execution_time} seconds")
+
         image = np.array(image.convert('RGBA'))
         image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGRA)
 
@@ -202,7 +250,7 @@ def inference(*, frame_queue, send_queue, verbose=False, sleep=0, depth_height=7
         # Step 2: Thresholding to separate the object from the background
         _, thresholded = cv2.threshold(image[:, :, 3], 254, 255, cv2.THRESH_BINARY_INV)
 
-        cv2.imwrite('debug.png', image)
+        # cv2.imwrite('debug.png', image)
         contours, hierarchy = cv2.findContours(thresholded, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE) #CHAIN_APPROX_SIMPLE
 
         results = []
@@ -234,7 +282,12 @@ def inference(*, frame_queue, send_queue, verbose=False, sleep=0, depth_height=7
         message = pixel2pose(results, depth, coeff_height, coeff_width)
         if len(message) > 0:
             send_queue.put(message)
-        cv2.imwrite("result.png", base_image1)
+        
+        # Add timestamp watermark for debug
+        timestamp = int(time.time())
+        cv2.putText(base_image1, str(timestamp), (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+        
+        cv2.imwrite('result.png', base_image1)
 
         if sleep > 0:
             time.sleep(sleep)
