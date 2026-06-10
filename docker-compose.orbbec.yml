@@ -11,17 +11,21 @@ services:
   automata-cv:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.orbbec
     privileged: true
     network_mode: host
     volumes:
       - .:/home/workspace
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /dev:/dev
-    device_cgroup_rules:
-      - 'c 81:* rmw'
-      - 'c 189:* rmw'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     environment:
       - DISPLAY=$DISPLAY  # needed to show results on screen
       - XAUTHORITY=$XAUTHORITY  # needed to show results on screen
-    command: bash -c "pip install --no-deps -e /home/workspace && pip install -r /home/workspace/requirements.txt && python3 /home/workspace/object_extraction.py"
+    command: bash -c "source /opt/venv/bin/activate && python3 /home/workspace/object_extraction.py --camera-type orbbec"

@@ -1,0 +1,46 @@
+ARG BASE_IMAGE="ubuntu:jammy"
+FROM ${BASE_IMAGE} as orbbec
+
+# To avoid waiting for input during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+     && apt-get install -y \
+        libgl1 \
+        libx11-xcb1 \
+        libusb-1.0-0 \
+        libglib2.0-0 \
+        udev \
+        python3-dev \
+        python3-venv \
+        python3-pip \
+     && apt-get clean all \
+     && rm -r /var/lib/apt/lists/*
+
+RUN python3 -m venv --system-site-packages /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN pip install --upgrade pip setuptools
+
+# Install core dependencies
+RUN pip install \
+    torch==2.5.0 \
+    torchvision \
+    einops \
+    kornia \
+    huggingface_hub \
+    opencv-python-headless \
+    timm \
+    scipy \
+    scikit-image \
+    numpy \
+    astropy \
+    matplotlib \
+    pandas \
+    scikit-learn \
+    paho-mqtt \
+    pyrealsense2 \
+    typing \
+    pyorbbecsdk2
+
+WORKDIR /home/workspace

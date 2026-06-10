@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automata_detection"
+version = "0.1.0"
+description = "Automata object detection for archaeological pieces using Realsense and BiRefNet"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision",
+    "numpy<2",
+    "opencv-python-headless",
+    "timm",
+    "scipy",
+    "scikit-image",
+    "kornia",
+    "einops",
+    "tqdm",
+    "prettytable",
+    "tabulate",
+    "huggingface-hub>0.25",
+    "accelerate",
+    "pyrealsense2",
+    "pyorbbecsdk",
+    "paho-mqtt",
+    "Pillow",
+    "matplotlib",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["automata_detection"]
