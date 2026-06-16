@@ -50,6 +50,8 @@ def pixel2pose(
     coeff_height: float,
     coeff_width: float,
     camera_type: str = "realsense",
+    depth_intrinsics: Any = None,
+    extrinsic: Any = None,
 ) -> List[Dict[str, float]]:
     """Convert pixel coordinates to physical 3D coordinates.
     
@@ -59,12 +61,13 @@ def pixel2pose(
         coeff_height: Height coefficient for scaling
         coeff_width: Width coefficient for scaling
         camera_type: Type of camera ("realsense" or "orbbec")
-    
+        depth_intrinsics: Intrinsics for the depth camera (required for Orbbec)
+        extrinsic: Extrinsic parameters for the camera (required for Orbbec)
     Returns:
         List of pose messages with 3D coordinates
     """
     # Select appropriate coordinate conversion function
-    coord_converter: Callable[[float, float, float], Tuple[float, float, float]]
+    coord_converter: Callable[[float, float, float, Any, Any], Tuple[float, float, float]]
     if camera_type == "orbbec":
         # Lazy import to avoid requiring pyorbbecsdk if not using Orbbec camera
         from .camera_orbbec import convert_depth_to_phys_coord_using_orbbec
@@ -85,13 +88,13 @@ def pixel2pose(
         x1 = x1 * coeff_width
         y1 = y1 * coeff_height
         z1 = float(depth[int(y1), int(x1)].item())
-        z1, x1, y1 = coord_converter(x1, y1, z1)
+        z1, x1, y1 = coord_converter(x1, y1, z1, depth_intrinsics, extrinsic)
 
         y2, x2 = cropper.cropped2orig(result["2"][1], result["2"][0])
         x2 = x2 * coeff_width
         y2 = y2 * coeff_height
         z2 = float(depth[int(y2), int(x2)].item())
-        z2, x2, y2 = coord_converter(x2, y2, z2)
+        z2, x2, y2 = coord_converter(x2, y2, z2, depth_intrinsics, extrinsic)
 
         if z1 != 0 and z2 != 0:
             message.append(

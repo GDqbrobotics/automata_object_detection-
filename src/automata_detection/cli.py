@@ -39,6 +39,7 @@ def main() -> None:
         print(f"[CLI] Using {camera_name} camera")
 
     frame_queue = Queue(maxsize=1)
+    parameters_queue = Queue(maxsize=1)
     send_queue = Queue()
 
     read_process = Process(
@@ -47,6 +48,7 @@ def main() -> None:
             "width": args.stream_width,
             "height": args.stream_height,
             "frame_queue": frame_queue,
+            "parameters_queue": parameters_queue,
             "verbose": args.verbose,
         },
     )
@@ -68,6 +70,7 @@ def main() -> None:
         target=start_inference,
         kwargs={
             "frame_queue": frame_queue,
+            "parameters_queue": parameters_queue,
             "send_queue": send_queue,
             "verbose": args.verbose,
             "sleep": args.inference_sleep,

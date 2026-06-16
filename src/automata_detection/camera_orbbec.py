@@ -47,19 +47,41 @@ class ImageCropper:
     def cropped2orig(self, row: int, col: int) -> Tuple[int, int]:
         return row + self.starting_row, col + self.starting_col
 
+# This class is needed to pass the parameters between processes because the original types cannot be pickled
+class Parameters:
+    def __init__(self, _depth_intrinsics, _extrinsic, _color_width, _color_height):
+        self.fx = _depth_intrinsics.fx
+        self.fy = _depth_intrinsics.fy
+        self.cx = _depth_intrinsics.cx
+        self.cy = _depth_intrinsics.cy
+        self.width = _depth_intrinsics.width
+        self.height = _depth_intrinsics.height
+        self.rot = _extrinsic.rot
+        self.transform = _extrinsic.transform
+        self.color_width = _color_width
+        self.color_height = _color_height
 
-def convert_depth_to_phys_coord_using_orbbec(x: float, y: float, depth: float) -> Tuple[float, float, float]:
-    """Convert depth pixel coordinates to physical 3D coordinates using Orbbec camera intrinsics."""
-    fx = DEFAULT_CAMERA_CONFIG.K[0]
-    fy = DEFAULT_CAMERA_CONFIG.K[4]
-    ppx = DEFAULT_CAMERA_CONFIG.K[2]
-    ppy = DEFAULT_CAMERA_CONFIG.K[5]
+def convert_depth_to_phys_coord_using_orbbec(x: float, y: float, depth: float, depth_intrinsics, extrinsic) -> Tuple[float, float, float]:
+    # x axis is frame width and y axis is height
+    res = transformation2dto3d(OBPoint2f(x, y), depth, depth_intrinsics, extrinsic)
+    
+    # print(f"Res Z = {res.z}")
+    #take the highest point in a radius intorn
+    radius = 10
+    for x_i in range(int(x)-radius,int(x)+radius,1):
+        for y_i in range(int(y)-radius,int(y)+radius,1):
+            res_i = transformation2dto3d(OBPoint2f(x_i, y_i), depth, depth_intrinsics, extrinsic)
+            if res_i.z < res.z and res_i.z != 0:
+                res.z = res_i.z 
+    # print(f"Filtered Res Z {res.z}")
+    
+    # original_point = (x , y , depth)
+    # print(f"\n--- Point Transformation ---")
+    # print(f"Original point: {original_point}")
+    # print("Transformed point:",res)
+    # print(f"--------------------------------------------")
+    return res.z, res.x, res.y
 
-    z = depth
-    x_phys = (x - ppx) * z / fx
-    y_phys = (y - ppy) * z / fy
-
-    return z, -x_phys, -y_phys
 
 
 def frame_to_bgr_image(frame: VideoFrame) -> Union[Optional[np.array], Any]:
@@ -125,7 +147,7 @@ def get_frame_data(color_frame, depth_frame):
     _initialized = True
     return color_width, color_height, depth_width, depth_height, color_intrinsics, color_distortion, depth_intrinsics, depth_distortion, extrinsic
 
-def read_camera(*, frame_queue,  width, height, verbose=False):
+def read_camera(*, frame_queue, parameters_queue, width, height, verbose=False):
     # Create a pipeline with default device
     pipeline = Pipeline()
     temporal_filter = TemporalFilter(alpha=0.5)
@@ -177,7 +199,8 @@ def read_camera(*, frame_queue,  width, height, verbose=False):
 
         if not _initialized: 
             _color_width, _color_height, _depth_width, _depth_height, _color_intrinsics, _color_distortion, _depth_intrinsics, _depth_distortion, _extrinsic = get_frame_data(color_frame, depth_frame)
-                
+            parameters_queue.put(Parameters(_depth_intrinsics, _extrinsic, _color_width, _color_height))
+
         # the depth frame has lower resolution than the color frame, so we need to resize it
         # to match the size of the color frame. We use the nearest neighbor interpolation
         # to avoid creating new data points (which could lead to incorrect depth values)

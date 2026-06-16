@@ -41,7 +41,7 @@ class ImageCropper:
         return row + self.starting_row, col + self.starting_col
 
 
-def convert_depth_to_phys_coord_using_realsense(x: float, y: float, depth: float) -> Tuple[float, float, float]:
+def convert_depth_to_phys_coord_using_realsense(x: float, y: float, depth: float, depth_intrinsics, extrinsic) -> Tuple[float, float, float]:
     intrinsics = rs.intrinsics()
     intrinsics.width = DEFAULT_CAMERA_CONFIG.width
     intrinsics.height = DEFAULT_CAMERA_CONFIG.height
@@ -55,7 +55,7 @@ def convert_depth_to_phys_coord_using_realsense(x: float, y: float, depth: float
     return result[2], -result[0], -result[1]
 
 
-def read_camera(*, frame_queue: Queue, width: int, height: int, verbose: bool = False) -> None:
+def read_camera(*, frame_queue: Queue, parameters_queue: Queue, width: int, height: int, verbose: bool = False) -> None:
     pipeline = rs.pipeline()
     config = rs.config()
 

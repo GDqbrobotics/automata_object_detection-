@@ -28,4 +28,4 @@ services:
     environment:
       - DISPLAY=$DISPLAY  # needed to show results on screen
       - XAUTHORITY=$XAUTHORITY  # needed to show results on screen
-    command: bash -c "source /opt/venv/bin/activate && python3 /home/workspace/object_extraction.py --camera-type orbbec"
+    command: bash -c "source /opt/venv/bin/activate && python3 /home/workspace/object_extraction.py --camera-type orbbec --stream-width 1280 --stream-height 720"

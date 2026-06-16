@@ -12,7 +12,7 @@ from .model import extract_object, load_model
 from .pose import find_min_segment, pixel2pose
 
 
-def start_inference(*, frame_queue: Queue, send_queue: Queue, verbose: bool = False, sleep: float = 0.0, depth_height: int = 720, depth_width: int = 1280, camera_type: str = "realsense") -> None:
+def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: Queue, verbose: bool = False, sleep: float = 0.0, depth_height: int = 720, depth_width: int = 1280, camera_type: str = "realsense") -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(device=device)
 
@@ -23,10 +23,29 @@ def start_inference(*, frame_queue: Queue, send_queue: Queue, verbose: bool = Fa
         DEFAULT_CAMERA_CONFIG.crop_starting_col,
     )
 
+    depth_intrinsics = None
+    extrinsic = None
+
     while True:
         if frame_queue.empty():
             time.sleep(sleep)
             continue
+
+        if camera_type == "orbbec" and not parameters_queue.empty():
+            from .camera_orbbec import OBCameraIntrinsic, OBExtrinsic
+            parameters = parameters_queue.get()
+            depth_intrinsics = OBCameraIntrinsic()
+            extrinsic = OBExtrinsic()
+            depth_intrinsics.fx = parameters.fx
+            depth_intrinsics.fy = parameters.fy
+            depth_intrinsics.cx = parameters.cx
+            depth_intrinsics.cy = parameters.cy
+            depth_intrinsics.width = parameters.width
+            depth_intrinsics.height = parameters.height
+            extrinsic.rot = parameters.rot
+            extrinsic.transform = parameters.transform
+            color_width = parameters.color_width
+            color_height = parameters.color_height
 
         frame, depth = frame_queue.get()
         coeff_height = depth_height / frame.shape[0]
@@ -49,7 +68,7 @@ def start_inference(*, frame_queue: Queue, send_queue: Queue, verbose: bool = Fa
         #canvas = np.ones_like(cv_image, dtype=np.uint8) * 255 #white background
 
         for contour in contours:
-            if contour.size < 300 or contour.size > 1500:
+            if contour.size < 200 or contour.size > 1500:
                 continue
 
             M = cv2.moments(contour)
@@ -68,7 +87,8 @@ def start_inference(*, frame_queue: Queue, send_queue: Queue, verbose: bool = Fa
 
             results.append({"1": segment_p1, "2": segment_p2})
 
-        message = pixel2pose(results, depth, coeff_height, coeff_width, camera_type=camera_type)
+        filtered_depth = cv2.medianBlur(depth, 5)  # Kernel size of 
+        message = pixel2pose(results, filtered_depth, coeff_height, coeff_width, camera_type=camera_type, depth_intrinsics=depth_intrinsics, extrinsic=extrinsic)
         if message:
             send_queue.put(message)
 
