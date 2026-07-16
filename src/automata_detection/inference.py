@@ -12,7 +12,7 @@ from .model import extract_object, load_model
 from .pose import find_min_segment, pixel2pose
 
 
-def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: Queue, verbose: bool = False, sleep: float = 0.0, depth_height: int = 720, depth_width: int = 1280, camera_type: str = "realsense") -> None:
+def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: Queue, objects_queue: Queue = None, verbose: bool = False, sleep: float = 0.0, depth_height: int = 720, depth_width: int = 1280, camera_type: str = "realsense") -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(device=device)
 
@@ -65,7 +65,11 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
         contours, _ = cv2.findContours(thresholded, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
 
         results = []
+        objects = []  # fragment outlines in full-frame coordinates, for the ArUco node
         #canvas = np.ones_like(cv_image, dtype=np.uint8) * 255 #white background
+
+        # Offset to move a point from crop coordinates to full-frame coordinates.
+        crop_offset = np.array([DEFAULT_CAMERA_CONFIG.crop_starting_col, DEFAULT_CAMERA_CONFIG.crop_starting_row])
 
         for contour in contours:
             if contour.size < 200 or contour.size > 1500:
@@ -87,7 +91,15 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
 
             results.append({"1": segment_p1, "2": segment_p2})
 
-        filtered_depth = cv2.medianBlur(depth, 5)  # Kernel size of 
+            # Keep the outline in full-frame coordinates so the ArUco node can
+            # tell which grid cells this fragment covers.
+            objects.append((contour + crop_offset).astype(np.int32))
+
+        # Send the fragment outlines to the ArUco node (drop old if the queue is full).
+        if objects_queue is not None and not objects_queue.full():
+            objects_queue.put(objects)
+
+        filtered_depth = cv2.medianBlur(depth, 5)  # Kernel size of
         message = pixel2pose(results, filtered_depth, coeff_height, coeff_width, camera_type=camera_type, depth_intrinsics=depth_intrinsics, extrinsic=extrinsic)
         if message:
             send_queue.put(message)

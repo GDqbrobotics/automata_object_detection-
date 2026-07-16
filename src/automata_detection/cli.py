@@ -1,6 +1,7 @@
 import argparse
 from multiprocessing import Process, Queue
 
+from .aruco import start_aruco
 from .inference import start_inference
 from .mqtt import mqtt_send
 
@@ -42,6 +43,15 @@ def main() -> None:
     parameters_queue = Queue(maxsize=1)
     send_queue = Queue()
 
+    # Queues that feed the ArUco node (so it does not steal frames/intrinsics
+    # from the inference process, which has its own queues).
+    aruco_frame_queue = Queue(maxsize=1)
+    aruco_parameters_queue = Queue(maxsize=1)
+
+    # Fragment outlines from inference to the ArUco node, used to color the
+    # occupied grid cells. maxsize=1 so only the freshest result is kept.
+    objects_queue = Queue(maxsize=1)
+
     read_process = Process(
         target=read_camera,
         kwargs={
@@ -49,6 +59,8 @@ def main() -> None:
             "height": args.stream_height,
             "frame_queue": frame_queue,
             "parameters_queue": parameters_queue,
+            "aruco_frame_queue": aruco_frame_queue,
+            "aruco_parameters_queue": aruco_parameters_queue,
             "verbose": args.verbose,
         },
     )
@@ -72,6 +84,19 @@ def main() -> None:
             "frame_queue": frame_queue,
             "parameters_queue": parameters_queue,
             "send_queue": send_queue,
+            "objects_queue": objects_queue,
+            "verbose": args.verbose,
+            "sleep": args.inference_sleep,
+            "camera_type": args.camera_type,
+        },
+    )
+
+    aruco_process = Process(
+        target=start_aruco,
+        kwargs={
+            "frame_queue": aruco_frame_queue,
+            "parameters_queue": aruco_parameters_queue,
+            "objects_queue": objects_queue,
             "verbose": args.verbose,
             "sleep": args.inference_sleep,
             "camera_type": args.camera_type,
@@ -81,4 +106,5 @@ def main() -> None:
     read_process.start()
     send_process.start()
     inference_process.start()
+    aruco_process.start()
     inference_process.join()

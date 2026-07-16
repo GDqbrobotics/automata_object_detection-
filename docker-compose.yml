@@ -24,4 +24,4 @@ services:
     environment:
       - DISPLAY=$DISPLAY  # needed to show results on screen
       - XAUTHORITY=$XAUTHORITY  # needed to show results on screen
-    command: bash -c "pip install --no-deps -e /home/workspace && pip install -r /home/workspace/requirements.txt && python3 /home/workspace/object_extraction.py"
+    command: bash -c "pip install --no-deps -e /home/workspace && pip install -r /home/workspace/requirements.txt && python3 /home/workspace/object_extraction.py --mqtt-host 127.0.0.1"

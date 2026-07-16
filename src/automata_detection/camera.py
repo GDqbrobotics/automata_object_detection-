@@ -55,7 +55,9 @@ def convert_depth_to_phys_coord_using_realsense(x: float, y: float, depth: float
     return result[2], -result[0], -result[1]
 
 
-def read_camera(*, frame_queue: Queue, parameters_queue: Queue, width: int, height: int, verbose: bool = False) -> None:
+def read_camera(*, frame_queue: Queue, parameters_queue: Queue, width: int, height: int, verbose: bool = False, aruco_frame_queue: Queue = None, aruco_parameters_queue: Queue = None) -> None:
+    # aruco_parameters_queue is accepted for a uniform interface with the Orbbec
+    # camera but it is not used here: RealSense intrinsics are fixed in config.py.
     pipeline = rs.pipeline()
     config = rs.config()
 
@@ -130,3 +132,7 @@ def read_camera(*, frame_queue: Queue, parameters_queue: Queue, width: int, heig
 
         if not frame_queue.full():
             frame_queue.put((color_image, depth_image))
+
+        # Also feed the ArUco node with the color frame only (no depth for now).
+        if aruco_frame_queue is not None and not aruco_frame_queue.full():
+            aruco_frame_queue.put(color_image)

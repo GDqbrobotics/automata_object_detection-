@@ -147,40 +147,88 @@ def get_frame_data(color_frame, depth_frame):
     _initialized = True
     return color_width, color_height, depth_width, depth_height, color_intrinsics, color_distortion, depth_intrinsics, depth_distortion, extrinsic
 
-def read_camera(*, frame_queue, parameters_queue, width, height, verbose=False):
-    # Create a pipeline with default device
-    pipeline = Pipeline()
-    temporal_filter = TemporalFilter(alpha=0.5)
+def open_pipeline(width, height):
+    """Create, configure and start an Orbbec pipeline.
+
+    Returns the started (pipeline, config). Raises on failure so the caller can
+    decide what to do: give up at startup, or keep retrying in the watchdog.
+    """
+    pipeline = Pipeline()  # Create a pipeline with default device
     config = Config()  # Initialize the config for the pipeline
+    # Enable depth and color sensors
+    for sensor_type in [OBSensorType.DEPTH_SENSOR, OBSensorType.COLOR_SENSOR]:
+        profile_list = pipeline.get_stream_profile_list(sensor_type)
+        assert profile_list is not None
+        profile = profile_list.get_default_video_stream_profile()
+        try:
+            for profile_iterator in profile_list:
+                if profile_iterator.get_width() == width and profile_iterator.get_height() == height:
+                    profile = profile_iterator
+                    break
+        except Exception as e:
+            print(e)
+        assert profile is not None
+        print(f"{sensor_type} profile:", profile)
+        config.enable_stream(profile)  # Enable the stream for the sensor
+
+    print("start pipeline")
+    pipeline.start(config)  # Start the pipeline with the config
+    return pipeline, config
+
+
+def read_camera(*, frame_queue, parameters_queue, width, height, verbose=False, aruco_frame_queue=None, aruco_parameters_queue=None):
+    temporal_filter = TemporalFilter(alpha=0.5)
     align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
+
+    # Open the camera. If this fails right at startup there is nothing to
+    # recover yet, so we just give up like before.
     try:
-        # Enable depth and color sensors
-        for sensor_type in [OBSensorType.DEPTH_SENSOR, OBSensorType.COLOR_SENSOR]:
-            profile_list = pipeline.get_stream_profile_list(sensor_type)
-            assert profile_list is not None
-            profile = profile_list.get_default_video_stream_profile()
-            try:
-                for profile_iterator in profile_list:
-                    if profile_iterator.get_width() == width and profile_iterator.get_height() == height:
-                        profile = profile_iterator
-                        break
-            except Exception as e:
-                print(e)
-            assert profile is not None
-            print(f"{sensor_type} profile:", profile)
-            config.enable_stream(profile)  # Enable the stream for the sensor
+        pipeline, config = open_pipeline(width, height)
     except Exception as e:
         print(e)
         return
 
-    print("start pipeline")
-    pipeline.start(config)  # Start the pipeline with the config
+    # Watchdog: the Orbbec stream can stall because of USB timing issues. If the
+    # camera stops giving frames for a while, we restart the pipeline so the app
+    # recovers by itself instead of freezing.
+    reset_timeout_s = 5.0
+    last_frame_time = time.time()
 
     while True:
-        # Wait for frames from the pipeline (with a timeout of 100 ms)
-        frames = pipeline.wait_for_frames(100)
+        # Wait for frames (timeout 100 ms). If the camera stalls, this can return
+        # nothing or raise an error, so we guard it.
+        try:
+            frames = pipeline.wait_for_frames(100)
+        except Exception:
+            frames = None
+
         if not frames:
+            # No frame this time: if it has been too long, restart the camera.
+            if time.time() - last_frame_time > reset_timeout_s:
+                print("[CAMERA] No frames for a while - restarting the camera")
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                # Release the old pipeline so the device is free before we open
+                # a new one (otherwise the device can stay "busy").
+                pipeline = None
+                # Keep retrying to reopen the camera. A USB glitch (or unplugging
+                # and replugging the cable) used to crash the whole process here
+                # because pipeline.start() was not guarded; now we retry until it
+                # works, so the app recovers by itself instead of freezing.
+                while True:
+                    time.sleep(2)
+                    try:
+                        pipeline, config = open_pipeline(width, height)
+                        break
+                    except Exception as error:
+                        print("[CAMERA] Camera restart failed, retrying:", error)
+                last_frame_time = time.time()
             continue
+
+        # The camera gave us frames: reset the watchdog timer.
+        last_frame_time = time.time()
 
         # --- Spatial Alignment ---
         # Transforms one stream to the coordinate system/FOV of the other
@@ -197,9 +245,14 @@ def read_camera(*, frame_queue, parameters_queue, width, height, verbose=False):
         if verbose: print("[STREAM] Read rgb frame of size", color_frame.get_width(), color_frame.get_height())
         if verbose: print("[STREAM] Read depth frame of size", depth_frame.get_width(), depth_frame.get_height())
 
-        if not _initialized: 
+        if not _initialized:
             _color_width, _color_height, _depth_width, _depth_height, _color_intrinsics, _color_distortion, _depth_intrinsics, _depth_distortion, _extrinsic = get_frame_data(color_frame, depth_frame)
-            parameters_queue.put(Parameters(_depth_intrinsics, _extrinsic, _color_width, _color_height))
+            parameters = Parameters(_depth_intrinsics, _extrinsic, _color_width, _color_height)
+            parameters_queue.put(parameters)
+
+            # Also send the intrinsics to the ArUco node (separate queue).
+            if aruco_parameters_queue is not None:
+                aruco_parameters_queue.put(parameters)
 
         # the depth frame has lower resolution than the color frame, so we need to resize it
         # to match the size of the color frame. We use the nearest neighbor interpolation
@@ -217,4 +270,8 @@ def read_camera(*, frame_queue, parameters_queue, width, height, verbose=False):
 
         if not frame_queue.full():
             frame_queue.put((image, depth))
+
+        # Also feed the ArUco node with the color frame only (no depth for now).
+        if aruco_frame_queue is not None and not aruco_frame_queue.full():
+            aruco_frame_queue.put(image)
 
