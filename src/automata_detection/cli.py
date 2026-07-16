@@ -52,6 +52,14 @@ def main() -> None:
     # occupied grid cells. maxsize=1 so only the freshest result is kept.
     objects_queue = Queue(maxsize=1)
 
+    # Grid bounding box from the ArUco node to inference, so the crop that
+    # BiRefNet runs on follows the grid instead of being static.
+    crop_queue = Queue(maxsize=1)
+
+    # Annotated inference frames (what result.png shows) from inference to the
+    # ArUco node, which serves them as a second video on the web page.
+    result_frame_queue = Queue(maxsize=1)
+
     read_process = Process(
         target=read_camera,
         kwargs={
@@ -85,6 +93,8 @@ def main() -> None:
             "parameters_queue": parameters_queue,
             "send_queue": send_queue,
             "objects_queue": objects_queue,
+            "crop_queue": crop_queue,
+            "result_frame_queue": result_frame_queue,
             "verbose": args.verbose,
             "sleep": args.inference_sleep,
             "camera_type": args.camera_type,
@@ -97,6 +107,8 @@ def main() -> None:
             "frame_queue": aruco_frame_queue,
             "parameters_queue": aruco_parameters_queue,
             "objects_queue": objects_queue,
+            "crop_queue": crop_queue,
+            "result_frame_queue": result_frame_queue,
             "verbose": args.verbose,
             "sleep": args.inference_sleep,
             "camera_type": args.camera_type,

@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -6,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 import numpy as np
 
-from .config import DEFAULT_ARUCO_CONFIG, DEFAULT_GRID_CONFIG
+from .config import ARTIFACT_COLORS, DEFAULT_ARUCO_CONFIG, DEFAULT_GRID_CONFIG
 
 # --- Settings (easy to change) ---
 STREAM_PORT = 8090            # open http://localhost:8090 in a browser to watch the video
@@ -24,30 +25,124 @@ LABEL_COLOR = (0, 0, 255)
 # Strongest transparency used to color a fully covered cell (0..1). A cell that is
 # only partly covered is drawn lighter, in proportion to its coverage (heatmap).
 MAX_ALPHA = 0.6
-# One color per fragment (BGR), cycled if there are more fragments than colors.
-HEATMAP_COLORS = [
-    (255, 0, 0),      # blue
-    (0, 0, 255),      # red
-    (0, 200, 0),      # green
-    (0, 200, 255),    # yellow
-    (255, 0, 255),    # magenta
-    (255, 200, 0),    # cyan
-    (0, 128, 255),    # orange
-]
-# The latest image (already encoded as JPEG) that the live stream sends to the browser.
-latest_jpeg = {"data": None}
+# Extra pixels added around the grid in the rectified crop sent to the inference
+# node, so fragments touching the grid border are not cut.
+CROP_MARGIN_PX = 40
+# Send a new crop only when a grid corner moved more than this (pixels), so the
+# crop does not wobble at every smoothing tick and make the segmentation flicker.
+CROP_CHANGE_PX = 15
+# The latest images (already encoded as JPEG) that the live streams send to the
+# browser: one for the ArUco grid view, one for the inference view.
+latest_jpeg = {"aruco": None, "inference": None}
 jpeg_lock = threading.Lock()
+# The latest artifact info (id, cells, grasp pose) as encoded JSON, polled by the page.
+latest_info = {"json": b'{"units": "", "artifacts": []}'}
+info_lock = threading.Lock()
+
+# The web page served at "/": the two videos side by side, and the artifact
+# info panel (cells + grasp poses) at the bottom left, refreshed twice a second.
+PAGE_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Automata Vision</title>
+<style>
+  body { font-family: sans-serif; background: #1e1e1e; color: #eee; margin: 16px; }
+  h2 { margin: 4px 0 8px; font-size: 16px; font-weight: normal; color: #bbb; }
+  .videos { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  .videos .panel { flex: 1; min-width: 320px; }
+  .videos img { width: 100%; border: 1px solid #444; border-radius: 4px; }
+  #info { margin-top: 16px; max-width: 760px; background: #2a2a2a; border: 1px solid #444;
+          border-radius: 6px; padding: 10px 14px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #444; }
+  th { color: #999; font-weight: normal; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+</style>
+</head>
+<body>
+<div class="videos">
+  <div class="panel"><h2>Griglia ArUco</h2><img src="/aruco"></div>
+  <div class="panel"><h2>Inferenza</h2><img src="/inference"></div>
+</div>
+<div id="info">
+  <h2>Reperti</h2>
+  <div id="artifacts">In attesa di dati...</div>
+</div>
+<script>
+function fmt(value, units) {
+  return units === "mm" ? value.toFixed(0) : value.toFixed(3);
+}
+async function refresh() {
+  try {
+    const response = await fetch("/data");
+    const data = await response.json();
+    const units = data.units;
+    const box = document.getElementById("artifacts");
+    if (!data.artifacts.length) {
+      box.textContent = "Nessun reperto sul tavolo.";
+      return;
+    }
+    let html = "<table><tr><th>Id</th><th>Celle</th>" +
+               "<th>Grasp 1 &mdash; x, y, z (" + units + ")</th>" +
+               "<th>Grasp 2 &mdash; x, y, z (" + units + ")</th></tr>";
+    for (const a of data.artifacts) {
+      const p = a.pose;
+      const g1 = p ? fmt(p.x_1, units) + ", " + fmt(p.y_1, units) + ", " + fmt(p.z_1, units) : "in attesa di depth";
+      const g2 = p ? fmt(p.x_2, units) + ", " + fmt(p.y_2, units) + ", " + fmt(p.z_2, units) : "";
+      html += "<tr><td><span class='dot' style='background:" + a.color + "'></span>" + a.id + "</td>" +
+              "<td>" + (a.cells || "-") + "</td><td>" + g1 + "</td><td>" + g2 + "</td></tr>";
+    }
+    html += "</table>";
+    box.innerHTML = html;
+  } catch (e) {
+    // Server briefly unavailable: keep the last table and retry.
+  }
+}
+setInterval(refresh, 500);
+refresh();
+</script>
+</body>
+</html>
+"""
 
 
-class MJPEGHandler(BaseHTTPRequestHandler): #Send the latest frame to the browser as an MJPEG video stream
+class MJPEGHandler(BaseHTTPRequestHandler):
+    """Serve the web page, the two MJPEG streams and the artifact info JSON."""
+
     def do_GET(self):
+        if self.path == "/":
+            body = PAGE_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/aruco":
+            self.send_mjpeg("aruco")
+        elif self.path == "/inference":
+            self.send_mjpeg("inference")
+        elif self.path == "/data":
+            with info_lock:
+                body = latest_info["json"]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def send_mjpeg(self, name):
+        """Send the latest frames of one stream as an endless MJPEG video."""
         self.send_response(200)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.end_headers()
         try:
             while True:
                 with jpeg_lock:
-                    jpeg = latest_jpeg["data"]
+                    jpeg = latest_jpeg[name]
                 if jpeg is not None:
                     self.wfile.write(b"--frame\r\n")
                     header = "Content-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(jpeg)
@@ -70,11 +165,38 @@ def start_stream_server(port): #start the video stream server in the background
     thread.start()
 
 
-def publish_to_stream(image): #Encode the image as JPEG and give it to the stream
+def publish_to_stream(image, name="aruco"): #Encode the image as JPEG and give it to one stream
     ok, buffer = cv2.imencode(".jpg", image)
     if ok:
         with jpeg_lock:
-            latest_jpeg["data"] = buffer.tobytes()
+            latest_jpeg[name] = buffer.tobytes()
+
+
+def color_to_css(artifact_id):
+    """Return the artifact's palette color as a CSS string like '#rrggbb'."""
+    blue, green, red = ARTIFACT_COLORS[artifact_id % len(ARTIFACT_COLORS)]
+    return "#%02x%02x%02x" % (red, green, blue)
+
+
+def publish_info(objects, cells_by_id, camera_type):
+    """Refresh the JSON the web page polls: id, color, cells and grasp pose per artifact."""
+    artifacts = []
+    for item in sorted(objects or [], key=lambda entry: entry["id"]):
+        artifact_id = item["id"]
+        occupied = cells_by_id.get(artifact_id, {})
+        names = [cell_name(col, row) for (col, row) in sorted(occupied.keys(), key=lambda rc: (rc[1], rc[0]))]
+        artifacts.append({
+            "id": artifact_id,
+            "color": color_to_css(artifact_id),
+            "cells": " ".join(names),
+            "pose": item.get("pose"),
+        })
+    body = json.dumps({
+        "units": "mm" if camera_type == "orbbec" else "m",
+        "artifacts": artifacts,
+    }).encode("utf-8")
+    with info_lock:
+        latest_info["json"] = body
 
 
 def save_image(image, path): #Save the image to disk safely (write a temp file, then rename it)
@@ -230,6 +352,75 @@ def draw_labels(image, transform, n_cols, n_rows):
         cv2.putText(image, letter, (px - 6, py + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LABEL_COLOR, 1, cv2.LINE_AA)
 
 
+def grid_corners_px(transform, n_cols, n_rows):
+    """Return the 4 grid corners in image pixels: TL, TR, BR, BL."""
+    return [
+        apply_affine(transform, 0, 0),
+        apply_affine(transform, n_cols, 0),
+        apply_affine(transform, n_cols, n_rows),
+        apply_affine(transform, 0, n_rows),
+    ]
+
+
+def build_crop_message(transform, n_cols, n_rows):
+    """Build the rectified-crop message for the inference node.
+
+    The crop is a straightened image of the grid only (plus CROP_MARGIN_PX on
+    every side), whatever the grid's rotation in the camera image. This way the
+    inference node never sees the table around the mat or the marker sheets —
+    with a plain bounding-box crop, a tilted grid let big background wedges into
+    the corners and BiRefNet segmented those instead of the fragments.
+
+    The message carries the affine matrix that maps CROP pixels back to
+    FULL-FRAME pixels, so the inference node can both warp the frame and convert
+    its results back. Returns None if the grid is degenerate (glitch).
+    """
+    # Size of one grid cell in image pixels (kept, so the crop has ~native
+    # resolution). The transform columns are the image-space vectors of one
+    # grid step along x and along y.
+    size_x = (transform[0][0] ** 2 + transform[1][0] ** 2) ** 0.5
+    size_y = (transform[0][1] ** 2 + transform[1][1] ** 2) ** 0.5
+    cell_px = (size_x + size_y) / 2.0
+    if cell_px < 10:
+        return None
+
+    grid_w = int(round(n_cols * cell_px))
+    grid_h = int(round(n_rows * cell_px))
+    margin = CROP_MARGIN_PX
+
+    # 3 matching points, crop pixels -> full-frame pixels (3 grid corners).
+    crop_points = np.array([
+        [margin, margin],
+        [margin + grid_w, margin],
+        [margin, margin + grid_h],
+    ], dtype=np.float32)
+    image_points = np.array([
+        apply_affine(transform, 0, 0),
+        apply_affine(transform, n_cols, 0),
+        apply_affine(transform, 0, n_rows),
+    ], dtype=np.float32)
+    matrix = cv2.getAffineTransform(crop_points, image_points)
+
+    return {
+        "matrix": matrix,
+        "width": grid_w + 2 * margin,
+        "height": grid_h + 2 * margin,
+        "margin": margin,
+    }
+
+
+def grid_corners_moved(old_corners, new_corners):
+    """True when any grid corner moved more than CROP_CHANGE_PX pixels."""
+    if old_corners is None:
+        return True
+    for old, new in zip(old_corners, new_corners):
+        dx = new[0] - old[0]
+        dy = new[1] - old[1]
+        if (dx * dx + dy * dy) ** 0.5 > CROP_CHANGE_PX:
+            return True
+    return False
+
+
 def cell_name(col, row):
     """Return a cell name like 'C3' from 1-based column and row numbers."""
     letter = chr(ord("A") + row - 1)
@@ -294,12 +485,12 @@ def fill_cell(image, poly, color, alpha):
     roi[mask > 0] = blended[mask > 0]
 
 
-def draw_heatmap(image, transform, fragments_cells):
-    """Color the occupied cells. Each fragment has its own color and a cell is
-    drawn stronger the more it is covered (heatmap).
+def draw_heatmap(image, transform, cells_by_id):
+    """Color the occupied cells. Each artifact keeps its own color (chosen from its
+    stable id) and a cell is drawn stronger the more it is covered (heatmap).
     """
-    for index, occupied in enumerate(fragments_cells):
-        color = HEATMAP_COLORS[index % len(HEATMAP_COLORS)]
+    for artifact_id, occupied in cells_by_id.items():
+        color = ARTIFACT_COLORS[artifact_id % len(ARTIFACT_COLORS)]
         for (col, row), coverage in occupied.items():
             # The 4 corners of the cell in image pixels.
             p1 = apply_affine(transform, col - 1, row - 1)
@@ -310,17 +501,26 @@ def draw_heatmap(image, transform, fragments_cells):
             fill_cell(image, poly, color, MAX_ALPHA * coverage)
 
 
-def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, verbose=False, sleep=0.0, camera_type="realsense"):
+def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, crop_queue=None, result_frame_queue=None, verbose=False, sleep=0.0, camera_type="realsense"):
     """ArUco node: read color frames, detect the markers, draw the grid overlay.
 
-    It shows a live video at http://localhost:8090 and saves aruco_result.png
-    every few seconds. It also colors the grid cells occupied by each fragment
-    (using the outlines sent by the inference node). It does not use depth yet.
+    It serves a web page at http://localhost:8090 with two live videos (the
+    grid view and the inference view) plus a realtime panel with each artifact's
+    occupied cells and grasp pose, and saves aruco_result.png every few seconds.
+    It also colors the grid cells occupied by each artifact (using the outlines
+    sent by the inference node). It does not use depth yet.
 
     Args:
         frame_queue: queue with the color images from the camera.
         parameters_queue: camera intrinsics (not used yet, needed later for 3D).
-        objects_queue: fragment outlines (full-frame coords) from the inference node.
+        objects_queue: [{"id": artifact_id, "contour": outline, "pose": ...}, ...]
+            from the inference node, full-frame coords, tagged with the artifact's
+            stable id so a cell's color/occupancy stays linked to one physical
+            artifact; the pose is shown on the web page.
+        crop_queue: where to send the grid's rectified crop so the inference
+            node's crop follows the grid instead of being static.
+        result_frame_queue: annotated frames from the inference node (what
+            result.png shows), served as the second video on the web page.
         verbose: print debug information.
         sleep: time to wait between iterations.
         camera_type: "realsense" or "orbbec".
@@ -333,9 +533,9 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, verbose=Fa
     detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     detector = cv2.aruco.ArucoDetector(dictionary, detector_params)
 
-    # Start the live video stream.
+    # Start the web server (page + the two video streams + artifact info).
     start_stream_server(STREAM_PORT)
-    print("[ARUCO] Live stream available at http://localhost:%d" % STREAM_PORT)
+    print("[ARUCO] Live view available at http://localhost:%d" % STREAM_PORT)
 
     n_cols = DEFAULT_GRID_CONFIG.n_cols
     n_rows = DEFAULT_GRID_CONFIG.n_rows
@@ -343,9 +543,11 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, verbose=Fa
     grid = None          # last good grid corners (kept so the overlay stays stable)
     skipped = 0          # how many frames in a row we ignored because of a big jump
     last_snapshot = 0.0
-    objects = None            # latest fragment outlines (full-frame) from inference
-    objects_dirty = False     # True when new outlines arrived and cells must be recomputed
-    fragments_cells = []      # cached: a {(col, row): coverage} dict per fragment
+    objects = None            # latest [{"id":.., "contour":..}] from inference (full-frame)
+    objects_dirty = False     # True when a new outlines payload arrived
+    force_recompute = False   # True when the grid itself really moved: recompute every id's cells
+    cells_by_id = {}          # cached: {artifact_id: {(col, row): coverage}}
+    last_sent_corners = None  # grid corners (image px) of the last crop sent to inference
 
     while True:
         if frame_queue.empty():
@@ -362,6 +564,11 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, verbose=Fa
             if objects_queue is not None and not objects_queue.empty():
                 objects = objects_queue.get()
                 objects_dirty = True
+
+            # Pick up the latest annotated inference frame and show it as the
+            # second video on the web page.
+            if result_frame_queue is not None and not result_frame_queue.empty():
+                publish_to_stream(result_frame_queue.get(), "inference")
 
             # Detect the markers on the gray version of the image.
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -389,12 +596,26 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, verbose=Fa
                         # take the new grid as-is instead of comparing it. Comparing
                         # two grids with different corners would fail, so we just
                         # adopt the new one and start smoothing again from here.
+                        # This is a real change, so every artifact's cells must be
+                        # recomputed against the new grid.
                         grid = found
                         skipped = 0
-                    elif grid_movement(grid, found) < JUMP_LIMIT or skipped >= MAX_SKIPPED:
-                        # Normal update (or accept after too many ignored frames).
+                        force_recompute = True
+                    elif grid_movement(grid, found) < JUMP_LIMIT:
+                        # Normal small update: just smooth toward it. This on its
+                        # own is NOT a real move, so already placed artifacts keep
+                        # their cached cells (this is what keeps them from drifting
+                        # every time the grid is re-detected).
                         grid = smooth_corners(grid, found)
                         skipped = 0
+                    elif skipped >= MAX_SKIPPED:
+                        # Big jump accepted after too many ignored frames: the grid
+                        # really moved, so adopt the new position at once. Smoothing
+                        # toward a far away position would crawl there a few percent
+                        # per accepted frame and take many seconds to catch up.
+                        grid = found
+                        skipped = 0
+                        force_recompute = True
                     else:
                         # Big jump: probably a glitch, ignore this frame.
                         skipped += 1
@@ -407,34 +628,72 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, verbose=Fa
                 draw_grid(image, transform, n_cols, n_rows)
                 draw_labels(image, transform, n_cols, n_rows)
 
-                # Recompute which cells each fragment occupies only when new
-                # outlines arrived (BiRefNet is slow, so this happens rarely).
-                if objects is not None and objects_dirty:
-                    fragments_cells = []
-                    for contour in objects:
-                        occupied = fragment_cells(
-                            transform, contour, n_cols, n_rows,
+                # Tell the inference node where the grid is, so its crop follows
+                # the grid. Sent only when a corner really moved. Freshest wins:
+                # a stale crop the inference did not consume yet is replaced,
+                # never left in the queue to be applied late.
+                if crop_queue is not None:
+                    corners_px = grid_corners_px(transform, n_cols, n_rows)
+                    if grid_corners_moved(last_sent_corners, corners_px):
+                        message = build_crop_message(transform, n_cols, n_rows)
+                        if message is not None:
+                            if crop_queue.full():
+                                try:
+                                    crop_queue.get_nowait()
+                                except Exception:
+                                    pass
+                            crop_queue.put(message)
+                            last_sent_corners = corners_px
+                            if verbose:
+                                print("[ARUCO] New crop sent: %dx%d px" % (message["width"], message["height"]))
+
+                # Update which cells each artifact occupies only when needed
+                # (BiRefNet is slow, so new outlines arrive rarely). An artifact
+                # that is still there and whose grid did not really move keeps its
+                # previously computed cells untouched - this is what keeps a placed
+                # artifact from drifting or changing color every time the grid is
+                # re-detected.
+                if objects is not None and (objects_dirty or force_recompute):
+                    current_ids = set(item["id"] for item in objects)
+
+                    # Drop cells for artifacts no longer being tracked (removed).
+                    for stale_id in list(cells_by_id.keys()):
+                        if stale_id not in current_ids:
+                            del cells_by_id[stale_id]
+
+                    for item in objects:
+                        # Skip artifacts already cached, unless the grid itself
+                        # moved and everything must be recomputed against it.
+                        if item["id"] in cells_by_id and not force_recompute:
+                            continue
+                        cells_by_id[item["id"]] = fragment_cells(
+                            transform, item["contour"], n_cols, n_rows,
                             DEFAULT_GRID_CONFIG.occupancy_threshold,
                             DEFAULT_GRID_CONFIG.coverage_samples,
                         )
-                        fragments_cells.append(occupied)
+
                     objects_dirty = False
+                    force_recompute = False
 
                 # Color the occupied cells every frame, following the current grid.
-                draw_heatmap(image, transform, fragments_cells)
+                draw_heatmap(image, transform, cells_by_id)
 
-            # Send the image to the live stream every frame.
-            publish_to_stream(image)
+            # Send the image to the live stream every frame, and refresh the
+            # info panel (cells + grasp poses) the web page polls.
+            publish_to_stream(image, "aruco")
+            publish_info(objects, cells_by_id, camera_type)
 
             # Save a snapshot to disk only every few seconds.
             now = time.time()
             if now - last_snapshot >= SNAPSHOT_INTERVAL_S:
                 save_image(image, "aruco_result.png")
                 last_snapshot = now
-                # Print the occupied cells for each fragment (no percentages).
-                for index, occupied in enumerate(fragments_cells):
+                # Print the occupied cells for each artifact (no percentages),
+                # sorted by id so the same artifact always prints on the same line.
+                for artifact_id in sorted(cells_by_id.keys()):
+                    occupied = cells_by_id[artifact_id]
                     names = [cell_name(col, row) for (col, row) in sorted(occupied.keys(), key=lambda rc: (rc[1], rc[0]))]
-                    print("[ARUCO] Reperto %d: %s" % (index + 1, " ".join(names)))
+                    print("[ARUCO] Reperto %d: %s" % (artifact_id, " ".join(names)))
         except Exception as error:
             # Log the problem and keep going with the next frame.
             print("[ARUCO] Skipping a frame after an error:", error)

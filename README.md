@@ -218,22 +218,113 @@ Some parameters are not exposed on the command line and live in
 | `width` / `height` | `1280` / `720` | Depth reference resolution. |
 | `K` | 3×3 intrinsic matrix (fx, fy, cx, cy) | Intrinsics used by the **RealSense** pixel→3D conversion. |
 | `D` | zeros | Distortion coefficients (none). |
-| `crop_width` / `crop_height` | `500` / `300` | Size of the region of interest that is segmented. |
-| `crop_starting_row` / `crop_starting_col` | centered in 1280×720 | Top-left corner of the crop. |
+| `crop_width` / `crop_height` | `720` / `420` | Size of the region of interest that is segmented (initial value). |
+| `crop_starting_row` / `crop_starting_col` | centered in 1280×720 | Top-left corner of the crop (initial value). |
 
 Only the area inside this crop is processed, which keeps inference fast and
-limits detection to the working surface. Adjust these values to move or resize
-the region of interest.
+limits detection to the working surface. These values are only the **starting
+crop**: as soon as the ArUco node detects the grid, it sends a **rectified crop**
+(the grid straightened via an affine warp, plus a margin) to the inference node
+and the crop follows the grid automatically from then on — re-aligning whenever
+the grid or the camera really moves, and staying correct even when the mat is
+rotated on the table.
 
-Other tunables that currently live in the code (not CLI flags):
+Other tunables in `config.py` (not CLI flags):
 
-- **Contour size filter** in `inference.py`: contours with fewer than `200` or
-  more than `1500` points are ignored — this rejects noise and oversized blobs.
-- **Alpha threshold** for turning the segmentation mask into a binary image
-  (`254` in `inference.py`).
+- **Detection filters** (`DetectionConfig`): `alpha_threshold` (default `250`,
+  mask pixels at or above it count as object — phantom masks are usually
+  weaker), `min_contour_size` / `max_contour_size` (default `200` / `4000`,
+  contours outside this range are rejected as noise or oversized blobs).
+- **Depth filters** (`DepthFilterConfig`): `max_artifact_height_mm`
+  (default `40`) — a segmented blob that sticks out of the table more than this
+  is treated as a hand or robot arm, not a fragment, and is ignored;
+  `min_artifact_height_mm` (default `2.0`) — a blob that does not rise above its
+  local surroundings by at least this much is treated as mat texture/shadow (a
+  BiRefNet "phantom") and never confirmed; set to `0` to disable, e.g. if very
+  flat fragments get rejected; `occlusion_freeze_fraction` (default `0.10`) —
+  when more than this fraction of the crop's depth pixels is "tall", the scene
+  counts as occluded and artifact tracking freezes (see below); `table_alpha` /
+  `table_relearn_cycles` — how the estimated table depth follows the
+  measurements.
+- **Artifact tracking** (`TrackerConfig`): `match_distance_px` (default `50`,
+  max centroid movement between cycles still counted as the same artifact),
+  `confirm_hits` (default `3`, consecutive detections a new artifact needs
+  before it gets an id and is published — kills one-cycle phantoms),
+  `miss_limit` (default `15`, consecutive cycles an artifact can go undetected
+  before it is dropped), `reacquire_window_s` (default `20.0`, how long a
+  dropped artifact can still get its old id back if it reappears at the same
+  spot), `heartbeat_s` (default `5.0`, how often the full artifact list is
+  republished even with no changes). See below.
+
+Tunables that still live in the code:
+
 - **Depth range** for Orbbec in `camera_orbbec.py`: `MIN_DEPTH = 20 mm`,
   `MAX_DEPTH = 10000 mm`.
 - **BiRefNet input size**: `1024×1024` in `model.py`.
+- **Crop margin around the grid** and ArUco stream/smoothing settings at the top
+  of `aruco.py`.
+
+---
+
+## Artifact tracking
+
+Every detected fragment is tracked across inference cycles (`tracker.py`) so it
+keeps a **stable identity, pose and color** once placed, instead of being
+re-estimated (and re-colored) every time BiRefNet runs or the ArUco grid is
+re-detected:
+
+- A new detection must be seen for `confirm_hits` (default 3) **consecutive**
+  cycles before it becomes an artifact — BiRefNet sometimes hallucinates objects
+  out of the empty mat's texture for a cycle or two, and those phantoms never
+  survive the confirmation. At confirmation the blob must also rise at least
+  `min_artifact_height_mm` above its local surroundings (averaged over the
+  confirmation cycles), or it is discarded as flat mat texture; a blob whose
+  depth cannot be judged (dark material, no IR return) is always kept.
+- A confirmed fragment gets an id and its pose is estimated **once**.
+- On later cycles it is matched to its existing track by position; its pose is
+  **not** recomputed as long as it keeps being matched.
+- If a fragment is not detected for more than `miss_limit` consecutive cycles,
+  its track is removed. If a detection then reappears **at the same spot** within
+  `reacquire_window_s` seconds (a fragment whose segmentation flickered on and
+  off), the old id and pose are **reacquired** instead of assigning a new id —
+  the reacquisition happens when the reappeared detection passes the same
+  `confirm_hits` confirmation, so a one-cycle phantom can never resurrect an old
+  id. A fragment that reappears somewhere else still gets a new id.
+- While the scene is **occluded** (a hand or robot arm over the table, detected
+  from the depth image — see `DepthFilterConfig` above), miss counting is frozen:
+  covered fragments never expire during a pick/place, and keep their id, pose,
+  color and grid cells when the hand leaves. Blobs that stick out of the table
+  more than `max_artifact_height_mm` are never counted as fragments, so the hand
+  itself does not occupy grid cells or get published over MQTT.
+- Physically moving a fragment is handled as remove-then-add: the old id expires
+  after `miss_limit` cycles while the new position appears immediately under a
+  new id, so both can briefly coexist in the published list during a move.
+
+### Published message format
+
+The inference stage publishes the full list of currently tracked artifacts (that
+have a valid pose) to `--mqtt-send-topic` as a JSON string, **only when the list
+actually changes** (an artifact was added, removed, or just got its first valid
+pose) plus a periodic heartbeat (`TrackerConfig.heartbeat_s`, default every 5s)
+so a consumer that missed a message stays in sync:
+
+```json
+[
+  {
+    "object_number": 1,
+    "x_1": 0.123, "y_1": -0.045, "z_1": 0.512,
+    "x_2": 0.130, "y_2": -0.060, "z_2": 0.515
+  }
+]
+```
+
+`object_number` is the artifact's **persistent tracking id** (not a per-frame
+index). Coordinates are in the camera's physical units (meters for RealSense,
+millimeters for Orbbec, following each SDK's deprojection). An artifact whose
+depth reads as `0` at either grasp-segment endpoint is kept as a track but left
+out of the published list until a valid reading is obtained. When the last
+artifact is removed, an **empty list `[]` is published** — this is how a
+consumer knows the table was cleared.
 
 ---
 
@@ -244,27 +335,8 @@ Other tunables that currently live in the code (not CLI flags):
 The broker is configured with the `--mqtt-*` flags listed above
 (`--mqtt-host`, `--mqtt-port`, `--mqtt-user`, `--mqtt-password`,
 `--mqtt-send-topic`). The client connects on startup and publishes continuously.
-
-### Published message format
-
-For each processed frame the inference stage builds a list with one entry per
-detected object and publishes it to `--mqtt-send-topic` as a JSON string.
-Each object contains the two endpoints of its grasp segment in 3D:
-
-```json
-[
-  {
-    "object_number": 0,
-    "x_1": 0.123, "y_1": -0.045, "z_1": 0.512,
-    "x_2": 0.130, "y_2": -0.060, "z_2": 0.515
-  }
-]
-```
-
-Coordinates are in the camera's physical units (meters for RealSense,
-millimeters for Orbbec, following each SDK's deprojection). Objects whose depth
-reads as `0` at either endpoint (invalid/missing depth) are skipped, and frames
-with no valid object produce no message.
+See [Artifact tracking](#artifact-tracking) above for when a message is actually
+sent and what it contains.
 
 ### Bundled Mosquitto broker
 
@@ -330,9 +402,15 @@ file also reserves one NVIDIA GPU for the container.
 
 ## Output
 
-- **`result.png`** — annotated frame, overwritten every iteration. Shows the
-  detected contours (red), centroids (green dots), and the grasp segment with
-  its endpoints (green line, yellow endpoints), plus a Unix timestamp.
+- **Web page at `http://localhost:8090`** — two live videos side by side (the
+  ArUco grid view and the annotated inference view) plus a realtime panel with
+  each artifact's id, occupied cells and grasp pose (endpoints in the camera
+  frame, m for RealSense / mm for Orbbec). The individual streams are also
+  available at `/aruco` and `/inference`, the raw info JSON at `/data`.
+- **`result.png`** — annotated inference frame, overwritten every iteration.
+  Shows the detected contours, centroids, and the grasp segment with its
+  endpoints, each artifact drawn in its stable color with its id.
+- **`aruco_result.png`** — the grid view snapshot, written every few seconds.
 - **MQTT messages** — published to `--mqtt-send-topic` as described above.
 
 ---
