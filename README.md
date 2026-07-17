@@ -281,7 +281,12 @@ re-detected:
   `min_artifact_height_mm` above its local surroundings (averaged over the
   confirmation cycles), or it is discarded as flat mat texture; a blob whose
   depth cannot be judged (dark material, no IR return) is always kept.
-- A confirmed fragment gets an id and its pose is estimated **once**.
+- A confirmed fragment gets an id and its pose is estimated **once**. Fragments
+  confirmed in the same cycle (the normal case when the mat is placed with all
+  its fragments already on it) get their ids in **reading order** of the grid:
+  top row first, then left to right — id 1 is the top-left fragment. A fragment
+  whose detection flickered during the confirmation window confirms later and
+  simply takes the next id.
 - On later cycles it is matched to its existing track by position; its pose is
   **not** recomputed as long as it keeps being matched. One exception: when the
   **grid really moves** (the ArUco node sends a new crop, i.e. a grid corner

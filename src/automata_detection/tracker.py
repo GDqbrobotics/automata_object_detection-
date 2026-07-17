@@ -25,7 +25,8 @@ class ArtifactTracker:
     """Matches new detections to previously tracked artifacts, by centroid distance.
 
     A detection is a dict: {"centroid": (x, y), "contour": ..., "segment": {"1": (x, y), "2": (x, y)},
-    "height_mm": float or None}. All coordinates are full-frame pixels, so tracking
+    "height_mm": float or None, "order_key": (grid row, x in the crop)}. All
+    coordinates except order_key are full-frame pixels, so tracking
     is not affected by where the crop currently is. The tracker only decides
     identity and position; it never touches the pose of an artifact that was
     already there - that is left to the caller (see inference.py), which is what
@@ -204,6 +205,7 @@ class ArtifactTracker:
             candidate["centroid"] = detection["centroid"]
             candidate["contour"] = detection["contour"]
             candidate["segment"] = detection["segment"]
+            candidate["order_key"] = detection.get("order_key", (0, 0))
             height = detection.get("height_mm")
             if height is not None:
                 candidate["height_sum"] += height
@@ -228,6 +230,7 @@ class ArtifactTracker:
                 "centroid": detection["centroid"],
                 "contour": detection["contour"],
                 "segment": detection["segment"],
+                "order_key": detection.get("order_key", (0, 0)),
                 "hits": 1,
                 "height_sum": 0.0,
                 "height_count": 0,
@@ -239,14 +242,21 @@ class ArtifactTracker:
                 candidate["height_count"] += 1
             next_pending.append(candidate)
 
-        # Confirm the candidates that were seen enough cycles in a row.
+        # Confirm the candidates that were seen enough cycles in a row. The ones
+        # confirmed in the same cycle are handled in reading order of the grid
+        # (top row first, then left to right), so a mat placed with all its
+        # fragments already on it gets predictable ids: 1 = top-left fragment.
         added_ids = []
         self.pending = []
+        confirmable = []
         for candidate in next_pending:
             if candidate["hits"] < self.confirm_hits:
                 self.pending.append(candidate)
-                continue
+            else:
+                confirmable.append(candidate)
+        confirmable.sort(key=lambda candidate: candidate.get("order_key", (0, 0)))
 
+        for candidate in confirmable:
             # Flat-phantom check: a "blob" that does not rise above its local
             # surroundings is the mat itself (texture/shadow), not an object.
             if self.min_height_mm > 0 and candidate["height_count"] > 0:

@@ -12,6 +12,7 @@ from .config import (
     ARTIFACT_COLORS,
     DEFAULT_DEPTH_FILTER_CONFIG,
     DEFAULT_DETECTION_CONFIG,
+    DEFAULT_GRID_CONFIG,
     DEFAULT_TRACKER_CONFIG,
 )
 from .model import extract_object, load_model
@@ -271,6 +272,16 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
         # not a fragment: it is skipped and it marks the scene as occluded.
         detections = []
         tall_blob_found = False
+
+        # Height of one grid cell in crop pixels (the crop is the straightened
+        # grid plus the margin ring). Used to give each detection a reading-order
+        # key - grid row first, then x - so that fragments confirmed together
+        # get their ids in a predictable order (top-left fragment = lowest id).
+        grid_height_px = crop_height - 2 * crop_margin
+        if grid_height_px <= 0:
+            grid_height_px = crop_height
+        cell_px = grid_height_px / DEFAULT_GRID_CONFIG.n_rows
+
         for contour in contours:
             if contour.size < DEFAULT_DETECTION_CONFIG.min_contour_size or contour.size > DEFAULT_DETECTION_CONFIG.max_contour_size:
                 continue
@@ -322,6 +333,9 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
                 # the tracker averages it over the confirmation cycles and drops
                 # flat "phantom" blobs that are just mat texture.
                 "height_mm": blob_height_local(contour_full, filtered_depth, coeff_height, coeff_width),
+                # Reading-order key (grid row, then x in the crop): fragments
+                # confirmed in the same cycle get their ids in this order.
+                "order_key": (int((cy - crop_margin) / cell_px), cx),
                 # Crop-local coordinates (only to draw on this cycle's result.png).
                 "centroid_crop": (cx, cy),
                 "segment_crop": {"1": segment_p1, "2": segment_p2},
