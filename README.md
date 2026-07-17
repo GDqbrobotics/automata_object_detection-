@@ -319,6 +319,34 @@ re-detected:
   the table clear for a few seconds between one mat and the next, or the old
   ids may survive into the new batch.
 
+### Daily examination records
+
+The ArUco node keeps a human-readable daily log in **`artefact_records.txt`**
+(written in the working directory, next to `result.png`). Every examination
+session — a mat placed under the camera with its artefacts — becomes one block
+with the session number, the start time, the artefact count and one line per
+artefact (id, occupied cells, grasp points). A summary with the day's totals
+stays at the top of the file:
+
+```
+ARTEFACT RECORDS - daily log
+Examinations today: 2 | Artefacts examined today: 7
+==================================================
+
+--------------------------------------------------
+Examination #1 - 2026-07-17 09:12:44
+artefacts: 4 | coordinates in mm
+--------------------------------------------------
+id 1 | cells: A2 A3 | grasp 1: 100, -50, 700 | grasp 2: 110, -40, 702
+...
+```
+
+The current session appears in the file too, marked `(in progress)`, and is
+finalized when the mat is removed — so the last session of the day is saved
+even if the app is stopped with the mat still on the table. The file survives
+app restarts (the counters are reloaded from it); it only restarts from zero
+with the **Clear daily log** button on the web page.
+
 ### Published message format
 
 The inference stage publishes the full list of currently tracked artifacts (that

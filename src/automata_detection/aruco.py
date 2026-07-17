@@ -45,6 +45,25 @@ jpeg_lock = threading.Lock()
 latest_info = {"json": b'{"units": "", "artifacts": []}'}
 info_lock = threading.Lock()
 
+# Daily record file: one text block per examination session (a mat placed with
+# its artefacts on it), separated by dashed lines, with a daily summary at the
+# top. The current session appears in the file too, marked "(in progress)", and
+# is finalized when the mat is removed - so the last session of the day is in
+# the file even if the app is stopped with the mat still on the table.
+RECORDS_FILE = "artefact_records.txt"
+RECORDS_HEADER_LINE = "=" * 50
+# The records state, shared with the web server thread (the clear button), so
+# every access goes through the lock like the other shared data above.
+records = {
+    "history": "",     # finalized session blocks, as already formatted text
+    "sessions": 0,     # number of finalized sessions today
+    "artefacts": 0,    # artefacts counted in the finalized sessions
+    "current": {},     # current session: {artifact_id: {"cells": ..., "pose": ...}}
+    "started_at": "",  # when the current session's first artefact appeared
+    "units": "",       # "mm" or "m", same as the web page
+}
+records_lock = threading.Lock()
+
 # The web page served at "/": the two videos side by side, and the artifact
 # info panel (cells + grasp poses) at the bottom left, refreshed twice a second.
 PAGE_HTML = """<!DOCTYPE html>
@@ -53,27 +72,47 @@ PAGE_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Automata Vision</title>
 <style>
-  body { font-family: sans-serif; background: #1e1e1e; color: #eee; margin: 16px; }
-  h2 { margin: 4px 0 8px; font-size: 16px; font-weight: normal; color: #bbb; }
-  .videos { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  body { font-family: system-ui, sans-serif; background: #121212; color: #d6d6d6;
+         margin: 0; padding: 22px 26px; }
+  h2 { margin: 0 0 8px; font-size: 11px; font-weight: 500; color: #8a8a8a;
+       text-transform: uppercase; letter-spacing: 0.09em; }
+  .videos { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }
   .videos .panel { flex: 1; min-width: 320px; }
-  .videos img { width: 100%; border: 1px solid #444; border-radius: 4px; }
-  #info { margin-top: 16px; max-width: 760px; background: #2a2a2a; border: 1px solid #444;
-          border-radius: 6px; padding: 10px 14px; }
-  table { border-collapse: collapse; width: 100%; font-size: 14px; }
-  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #444; }
-  th { color: #999; font-weight: normal; }
-  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  .videos img { display: block; width: 100%; border: 1px solid #2c2c2c; }
+  #info { margin-top: 26px; max-width: 880px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #242424;
+           white-space: nowrap; }
+  th { color: #7a7a7a; font-weight: 500; font-size: 11px;
+       text-transform: uppercase; letter-spacing: 0.06em; }
+  td.mono { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums;
+            color: #c4c4c4; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         margin-right: 8px; vertical-align: middle; }
+  .empty { color: #6f6f6f; font-size: 13px; }
+  #clock { position: absolute; top: 20px; right: 26px; color: #6f6f6f; font-size: 12px;
+           font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .info-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px; }
+  .info-head h2 { margin: 0; }
+  .muted { color: #6f6f6f; font-size: 12px; }
+  #clear { margin-left: auto; background: none; border: 1px solid #333; color: #8a8a8a;
+           font-size: 11px; padding: 3px 10px; cursor: pointer; }
+  #clear:hover { border-color: #555; color: #c4c4c4; }
 </style>
 </head>
 <body>
+<div id="clock"></div>
 <div class="videos">
-  <div class="panel"><h2>Griglia ArUco</h2><img src="/aruco"></div>
-  <div class="panel"><h2>Inferenza</h2><img src="/inference"></div>
+  <div class="panel"><h2>Artefact Container Cells</h2><img src="/aruco"></div>
+  <div class="panel"><h2>Grasping Pose</h2><img src="/inference"></div>
 </div>
 <div id="info">
-  <h2>Reperti</h2>
-  <div id="artifacts">In attesa di dati...</div>
+  <div class="info-head">
+    <h2>Artefacts</h2>
+    <span id="daily" class="muted"></span>
+    <button id="clear" title="Restart today's artefact_records.txt from zero">Clear daily log</button>
+  </div>
+  <div id="artifacts"><span class="empty">Waiting for data...</span></div>
 </div>
 <script>
 function fmt(value, units) {
@@ -84,20 +123,23 @@ async function refresh() {
     const response = await fetch("/data");
     const data = await response.json();
     const units = data.units;
+    const r = data.records;
+    document.getElementById("daily").textContent =
+      r ? "Today: " + r.examinations + " examinations · " + r.artefacts + " artefacts" : "";
     const box = document.getElementById("artifacts");
     if (!data.artifacts.length) {
-      box.textContent = "Nessun reperto sul tavolo.";
+      box.innerHTML = "<span class='empty'>No artefacts on the table.</span>";
       return;
     }
-    let html = "<table><tr><th>Id</th><th>Celle</th>" +
+    let html = "<table><tr><th>Id</th><th>Cells</th>" +
                "<th>Grasp 1 &mdash; x, y, z (" + units + ")</th>" +
                "<th>Grasp 2 &mdash; x, y, z (" + units + ")</th></tr>";
     for (const a of data.artifacts) {
       const p = a.pose;
-      const g1 = p ? fmt(p.x_1, units) + ", " + fmt(p.y_1, units) + ", " + fmt(p.z_1, units) : "in attesa di depth";
+      const g1 = p ? fmt(p.x_1, units) + ", " + fmt(p.y_1, units) + ", " + fmt(p.z_1, units) : "waiting for depth";
       const g2 = p ? fmt(p.x_2, units) + ", " + fmt(p.y_2, units) + ", " + fmt(p.z_2, units) : "";
       html += "<tr><td><span class='dot' style='background:" + a.color + "'></span>" + a.id + "</td>" +
-              "<td>" + (a.cells || "-") + "</td><td>" + g1 + "</td><td>" + g2 + "</td></tr>";
+              "<td>" + (a.cells || "-") + "</td><td class='mono'>" + g1 + "</td><td class='mono'>" + g2 + "</td></tr>";
     }
     html += "</table>";
     box.innerHTML = html;
@@ -107,6 +149,16 @@ async function refresh() {
 }
 setInterval(refresh, 500);
 refresh();
+function tick() {
+  document.getElementById("clock").textContent = new Date().toLocaleTimeString();
+}
+setInterval(tick, 1000);
+tick();
+document.getElementById("clear").onclick = async function () {
+  if (!confirm("Clear today's records? artefact_records.txt restarts from zero.")) return;
+  try { await fetch("/clear_history", {method: "POST"}); } catch (e) {}
+  refresh();
+};
 </script>
 </body>
 </html>
@@ -136,6 +188,26 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/clear_history":
+            # The web page's clear button: restart the daily records from zero.
+            # If a mat is on the table right now, its session simply starts
+            # again as Examination #1 on the next update.
+            with records_lock:
+                records["history"] = ""
+                records["sessions"] = 0
+                records["artefacts"] = 0
+                records["current"] = {}
+                records["started_at"] = ""
+            write_records_file()
+            print("[ARUCO] Daily records cleared from the web page")
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
@@ -197,12 +269,97 @@ def publish_info(objects, cells_by_id, camera_type):
             "cells": " ".join(names),
             "pose": item.get("pose"),
         })
+    # Daily counters for the web page: sessions and artefacts, including the
+    # session still in progress.
+    with records_lock:
+        examinations = records["sessions"] + (1 if records["current"] else 0)
+        total_artefacts = records["artefacts"] + len(records["current"])
     body = json.dumps({
         "units": "mm" if camera_type == "orbbec" else "m",
         "artifacts": artifacts,
+        "records": {"examinations": examinations, "artefacts": total_artefacts},
     }).encode("utf-8")
     with info_lock:
         latest_info["json"] = body
+
+
+def load_records_history():
+    """Reload today's already saved sessions from the records file.
+
+    Called once at startup: a restart of the app keeps counting from where it
+    was. The file only restarts from zero with the web page's clear button.
+    """
+    try:
+        with open(RECORDS_FILE, "r") as records_file:
+            content = records_file.read()
+    except OSError:
+        return
+    # The saved sessions are everything below the summary header.
+    if RECORDS_HEADER_LINE in content:
+        history = content.split(RECORDS_HEADER_LINE, 1)[1].lstrip("\n")
+    else:
+        history = content
+    with records_lock:
+        records["history"] = history
+        records["sessions"] = history.count("Examination #")
+        records["artefacts"] = sum(1 for line in history.splitlines() if line.startswith("id "))
+
+
+def format_grasp_text(pose, units):
+    """The two grasp points as one text line, like the web table shows them."""
+    if pose is None:
+        return "grasp: waiting for depth"
+    number = "%.0f" if units == "mm" else "%.3f"
+    grasp_1 = ", ".join(number % pose[key] for key in ("x_1", "y_1", "z_1"))
+    grasp_2 = ", ".join(number % pose[key] for key in ("x_2", "y_2", "z_2"))
+    return "grasp 1: %s | grasp 2: %s" % (grasp_1, grasp_2)
+
+
+def format_session_block(number, started_at, session, units, in_progress):
+    """One examination session as text: dashed title, then one line per artefact."""
+    state = " (in progress)" if in_progress else ""
+    lines = [
+        "-" * 50,
+        "Examination #%d - %s%s" % (number, started_at, state),
+        "artefacts: %d | coordinates in %s" % (len(session), units),
+        "-" * 50,
+    ]
+    for artifact_id in sorted(session.keys()):
+        entry = session[artifact_id]
+        cells = entry["cells"] if entry["cells"] else "-"
+        lines.append("id %d | cells: %s | %s" % (artifact_id, cells, format_grasp_text(entry["pose"], units)))
+    return "\n".join(lines) + "\n"
+
+
+def write_records_file():
+    """Rewrite the whole records file: summary, saved sessions, current session.
+
+    The file is small, so rewriting it completely (safely, via a temp file) is
+    the simplest way to keep the summary on top always up to date.
+    """
+    with records_lock:
+        history = records["history"]
+        sessions = records["sessions"]
+        artefacts = records["artefacts"]
+        current = dict(records["current"])
+        started_at = records["started_at"]
+        units = records["units"]
+
+    if current:
+        sessions += 1
+        artefacts += len(current)
+
+    content = "ARTEFACT RECORDS - daily log\n"
+    content += "Examinations today: %d | Artefacts examined today: %d\n" % (sessions, artefacts)
+    content += RECORDS_HEADER_LINE + "\n\n"
+    content += history
+    if current:
+        content += format_session_block(sessions, started_at, current, units, True)
+
+    temp_path = RECORDS_FILE + ".tmp"
+    with open(temp_path, "w") as records_file:
+        records_file.write(content)
+    os.replace(temp_path, RECORDS_FILE)
 
 
 def save_image(image, path): #Save the image to disk safely (write a temp file, then rename it)
@@ -543,6 +700,9 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, crop_queue
     start_stream_server(STREAM_PORT)
     print("[ARUCO] Live view available at http://localhost:%d" % STREAM_PORT)
 
+    # Reload today's records so a restart keeps counting from where it was.
+    load_records_history()
+
     n_cols = DEFAULT_GRID_CONFIG.n_cols
     n_rows = DEFAULT_GRID_CONFIG.n_rows
 
@@ -647,6 +807,22 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, crop_queue
                     # so the inference node also learns the grid returned.
                     last_sent_corners = None
                     print("[ARUCO] No markers for a while - mat removed")
+
+                    # The mat is gone: finalize the examination session in the
+                    # daily records file (if any artefact was seen).
+                    with records_lock:
+                        if records["current"]:
+                            records["sessions"] += 1
+                            block = format_session_block(
+                                records["sessions"], records["started_at"],
+                                records["current"], records["units"], False,
+                            )
+                            records["history"] += block + "\n"
+                            records["artefacts"] += len(records["current"])
+                            records["current"] = {}
+                            records["started_at"] = ""
+                            print("[ARUCO] Examination #%d saved to %s" % (records["sessions"], RECORDS_FILE))
+                    write_records_file()
                     if crop_queue is not None:
                         if crop_queue.full():
                             try:
@@ -711,6 +887,21 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, crop_queue
                 # Color the occupied cells every frame, following the current grid.
                 draw_heatmap(image, transform, cells_by_id)
 
+            # Keep the daily records' current session up to date: every artefact
+            # seen in this session, with its latest cells and grasp pose. Not
+            # while the mat is judged removed: right after that, "objects" still
+            # holds the last artefacts for a moment (until the inference node's
+            # reset arrives), and they must not restart a session by mistake.
+            if objects and not grid_lost:
+                with records_lock:
+                    records["units"] = "mm" if camera_type == "orbbec" else "m"
+                    if not records["current"]:
+                        records["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    for item in objects:
+                        occupied = cells_by_id.get(item["id"], {})
+                        names = [cell_name(col, row) for (col, row) in sorted(occupied.keys(), key=lambda rc: (rc[1], rc[0]))]
+                        records["current"][item["id"]] = {"cells": " ".join(names), "pose": item.get("pose")}
+
             # Send the image to the live stream every frame, and refresh the
             # info panel (cells + grasp poses) the web page polls.
             publish_to_stream(image, "aruco")
@@ -720,6 +911,9 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, crop_queue
             now = time.time()
             if now - last_snapshot >= SNAPSHOT_INTERVAL_S:
                 save_image(image, "aruco_result.png")
+                # Keep the records file fresh too (the current session is in it,
+                # marked "in progress", so nothing is lost if the app stops).
+                write_records_file()
                 last_snapshot = now
                 # Print the occupied cells for each artifact (no percentages),
                 # sorted by id so the same artifact always prints on the same line.
