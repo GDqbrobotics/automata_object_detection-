@@ -262,7 +262,8 @@ Tunables that still live in the code:
   `MAX_DEPTH = 10000 mm`.
 - **BiRefNet input size**: `1024×1024` in `model.py`.
 - **Crop margin around the grid** and ArUco stream/smoothing settings at the top
-  of `aruco.py`.
+  of `aruco.py`, including `GRID_LOST_FRAMES` (consecutive frames with no ArUco
+  marker at all before the mat counts as removed and the artifact ids are reset).
 
 ---
 
@@ -282,7 +283,12 @@ re-detected:
   depth cannot be judged (dark material, no IR return) is always kept.
 - A confirmed fragment gets an id and its pose is estimated **once**.
 - On later cycles it is matched to its existing track by position; its pose is
-  **not** recomputed as long as it keeps being matched.
+  **not** recomputed as long as it keeps being matched. One exception: when the
+  **grid really moves** (the ArUco node sends a new crop, i.e. a grid corner
+  moved more than `CROP_CHANGE_PX`), the fragments moved with the mat, so every
+  stored pose is dropped and re-estimated at the new position — the ids and
+  colors are kept. Grid re-detection jitter below that threshold still never
+  touches the poses.
 - If a fragment is not detected for more than `miss_limit` consecutive cycles,
   its track is removed. If a detection then reappears **at the same spot** within
   `reacquire_window_s` seconds (a fragment whose segmentation flickered on and
@@ -299,6 +305,14 @@ re-detected:
 - Physically moving a fragment is handled as remove-then-add: the old id expires
   after `miss_limit` cycles while the new position appears immediately under a
   new id, so both can briefly coexist in the published list during a move.
+- When **no ArUco marker is visible** for `GRID_LOST_FRAMES` consecutive frames
+  (the whole mat was taken off the table), the tracker is **reset**: every id is
+  forgotten (an empty artifact list is published) and the next batch of
+  fragments starts again from id 1. The reset only fires once the table is
+  really empty and not occluded, so a hand or the robot arm briefly covering
+  all the markers can never wipe the ids of fragments still on the mat. Leave
+  the table clear for a few seconds between one mat and the next, or the old
+  ids may survive into the new batch.
 
 ### Published message format
 

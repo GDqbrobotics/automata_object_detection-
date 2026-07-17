@@ -31,6 +31,12 @@ CROP_MARGIN_PX = 40
 # Send a new crop only when a grid corner moved more than this (pixels), so the
 # crop does not wobble at every smoothing tick and make the segmentation flicker.
 CROP_CHANGE_PX = 15
+# After this many consecutive frames with no ArUco marker at all, the mat is
+# considered removed: the grid is forgotten and the inference node is told, so
+# it can reset the artifact ids for the next batch. At ~15 fps this is a few
+# seconds - long enough that the robot arm briefly covering the markers can
+# never trigger it.
+GRID_LOST_FRAMES = 45
 # The latest images (already encoded as JPEG) that the live streams send to the
 # browser: one for the ArUco grid view, one for the inference view.
 latest_jpeg = {"aruco": None, "inference": None}
@@ -542,6 +548,8 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, crop_queue
 
     grid = None          # last good grid corners (kept so the overlay stays stable)
     skipped = 0          # how many frames in a row we ignored because of a big jump
+    frames_without_markers = 0  # consecutive frames with no marker detected at all
+    grid_lost = False           # True after the mat was judged removed (no markers for a while)
     last_snapshot = 0.0
     objects = None            # latest [{"id":.., "contour":..}] from inference (full-frame)
     objects_dirty = False     # True when a new outlines payload arrived
@@ -576,6 +584,10 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, crop_queue
 
             image = frame.copy()
             if ids is not None:
+                # At least one marker is visible, so the mat is there.
+                frames_without_markers = 0
+                grid_lost = False
+
                 # Draw only the marker outlines, not the ID numbers (pass None
                 # instead of ids so OpenCV does not print the id over the marker).
                 cv2.aruco.drawDetectedMarkers(image, corners, None)
@@ -619,8 +631,29 @@ def start_aruco(*, frame_queue, parameters_queue, objects_queue=None, crop_queue
                     else:
                         # Big jump: probably a glitch, ignore this frame.
                         skipped += 1
-            elif verbose:
-                print("[ARUCO] No markers detected")
+            else:
+                if verbose:
+                    print("[ARUCO] No markers detected")
+
+                # No marker at all: if it lasts long enough, the mat was removed.
+                # Forget the grid (the overlay disappears from the web page) and
+                # tell the inference node once, so it resets the artifact ids.
+                frames_without_markers += 1
+                if frames_without_markers >= GRID_LOST_FRAMES and not grid_lost:
+                    grid_lost = True
+                    grid = None
+                    skipped = 0
+                    # Force an unconditional crop send when the grid comes back,
+                    # so the inference node also learns the grid returned.
+                    last_sent_corners = None
+                    print("[ARUCO] No markers for a while - mat removed")
+                    if crop_queue is not None:
+                        if crop_queue.full():
+                            try:
+                                crop_queue.get_nowait()
+                            except Exception:
+                                pass
+                        crop_queue.put({"grid_lost": True})
 
             # Draw the last known grid (stays on screen even if a marker is missed).
             transform = grid_to_image_transform(grid, n_cols, n_rows)

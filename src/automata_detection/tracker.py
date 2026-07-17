@@ -158,6 +158,18 @@ class ArtifactTracker:
 
         return added_ids, removed_ids, detection_track_ids
 
+    def reset(self) -> None:
+        """Forget everything: called when the mat is removed from the table.
+
+        The next batch of fragments starts clean from id 1. The lost cache is
+        cleared too, so a new fragment placed near an old position can never
+        reacquire a previous batch's id (and its frozen pose).
+        """
+        self.tracks.clear()
+        self.pending.clear()
+        self.lost.clear()
+        self._next_id = 1
+
     def _update_pending(self, detections: List[dict], leftover: List[int], detection_track_ids: List[Optional[int]]) -> List[int]:
         """Advance the pending candidates with this cycle's leftover detections.
 

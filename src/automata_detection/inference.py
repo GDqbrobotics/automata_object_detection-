@@ -185,6 +185,9 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
     table_disagree_count = 0  # cycles in a row the measurement disagreed with the estimate
     scene_occluded = False    # True while a hand/arm is over the table
 
+    grid_lost = False         # True while the ArUco node sees no grid (mat removed)
+    reset_pending = False     # a tracker reset is due as soon as the table is really empty
+
     while True:
         if frame_queue.empty():
             time.sleep(sleep)
@@ -207,15 +210,32 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
             color_height = parameters.color_height
 
         # Follow the grid: the ArUco node sends a rectified crop (matrix + size)
-        # whenever the grid really moves.
+        # whenever the grid really moves. It sends {"grid_lost": True} instead
+        # when no marker has been visible for a while (the mat was removed):
+        # the artifact ids must then restart from 1 for the next batch. The
+        # current crop is kept as-is until the grid comes back.
         if crop_queue is not None and not crop_queue.empty():
             crop = crop_queue.get()
-            crop_matrix = crop["matrix"]
-            crop_width = crop["width"]
-            crop_height = crop["height"]
-            crop_margin = crop["margin"]
-            if verbose:
-                print("[INFERENCE] Crop follows the grid: %dx%d px" % (crop_width, crop_height))
+            if crop.get("grid_lost"):
+                grid_lost = True
+                reset_pending = True
+                if verbose:
+                    print("[INFERENCE] Grid lost (mat removed?): tracker reset pending")
+            else:
+                grid_lost = False
+                crop_matrix = crop["matrix"]
+                crop_width = crop["width"]
+                crop_height = crop["height"]
+                crop_margin = crop["margin"]
+                if verbose:
+                    print("[INFERENCE] Crop follows the grid: %dx%d px" % (crop_width, crop_height))
+
+                # A crop only arrives when the grid really moved: the fragments
+                # moved with the mat, so every stored pose is stale. Drop the
+                # poses (the ids are kept!) - each one is re-estimated at the
+                # new position as soon as its artifact is seen again.
+                for track in tracker.tracks.values():
+                    track.pose_valid = False
 
         frame, depth = frame_queue.get()
         coeff_height = depth_height / frame.shape[0]
@@ -253,6 +273,15 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
         tall_blob_found = False
         for contour in contours:
             if contour.size < DEFAULT_DETECTION_CONFIG.min_contour_size or contour.size > DEFAULT_DETECTION_CONFIG.max_contour_size:
+                continue
+
+            # A blob covering a big part of the crop is the bare table seen when
+            # the mat is removed (BiRefNet sometimes segments the whole scene as
+            # one object), never a fragment. Skipping it also keeps it from
+            # blocking the empty-table tracker reset.
+            if cv2.contourArea(contour) > DEFAULT_DETECTION_CONFIG.max_area_fraction * crop_width * crop_height:
+                if verbose:
+                    print("[INFERENCE] Skipping a blob as big as the crop (bare table?)")
                 continue
 
             M = cv2.moments(contour)
@@ -319,14 +348,37 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
         # that has already been placed. While the scene is occluded the misses are
         # frozen, so a covered artifact never expires during a pick/place.
         before_ids = {track_id for track_id, track in tracker.tracks.items() if track.pose_valid}
+
+        # Pending tracker reset (the ArUco grid disappeared = mat removed): do
+        # it only when the table is really empty and not occluded, so a robot
+        # arm that briefly covers all the markers can never wipe live ids. If
+        # the grid comes back while the pieces are still detected, it was a
+        # false alarm and the reset is cancelled. Done after the before_ids
+        # snapshot, so the emptied artifact list is published this same cycle.
+        if reset_pending:
+            if not grid_lost and len(detections) > 0:
+                reset_pending = False
+                if verbose:
+                    print("[INFERENCE] Grid is back and objects are still there: reset cancelled")
+            elif len(detections) == 0 and not occluded:
+                tracker.reset()
+                reset_pending = False
+                print("[INFERENCE] Mat removed - tracker reset, ids restart from 1")
+
         added_ids, removed_ids, detection_track_ids = tracker.update(detections, freeze_misses=occluded)
         if verbose and (added_ids or removed_ids):
             print("[INFERENCE] Tracks added:", added_ids, "removed:", removed_ids)
 
-        # Estimate the pose once for any artifact that does not have a valid one yet
-        # (a brand new artifact, or one whose depth reading was invalid last time).
-        for track in tracker.tracks.values():
+        # Estimate the pose for any artifact that does not have a valid one yet
+        # (a brand new artifact, one whose depth reading was invalid last time,
+        # or one whose pose was dropped because the mat moved). Only for
+        # artifacts actually seen this cycle: a missed artifact's stored
+        # segment is stale, estimating from it would give the old position.
+        seen_ids = set(track_id for track_id in detection_track_ids if track_id is not None)
+        for track_id, track in tracker.tracks.items():
             if track.pose_valid:
+                continue
+            if track_id not in seen_ids:
                 continue
             pose = segment_to_pose(
                 track.segment, filtered_depth, coeff_height, coeff_width,
@@ -376,8 +428,6 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
             send_queue.put(message)
             last_publish_time = now
 
-        timestamp = int(time.time())
-        cv2.putText(cv_image, str(timestamp), (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.imwrite("result.png", cv_image)
 
         # Also send the annotated frame to the ArUco node, which shows it as a

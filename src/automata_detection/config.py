@@ -61,6 +61,7 @@ class DetectionConfig:
     alpha_threshold: int = 250    # BiRefNet mask pixels with alpha >= this count as object (phantom masks are usually weaker)
     min_contour_size: int = 200   # contours smaller than this are noise and are ignored
     max_contour_size: int = 4000  # contours bigger than this are ignored (oversized blobs)
+    max_area_fraction: float = 0.3  # a blob covering more than this fraction of the crop is the bare table (mat removed), not a fragment
 
 
 DEFAULT_DETECTION_CONFIG = DetectionConfig()
