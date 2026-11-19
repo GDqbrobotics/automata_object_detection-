@@ -1,8 +1,12 @@
+import time
 from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 
 from .camera import DEFAULT_CAMERA_CONFIG, ImageCropper, convert_depth_to_phys_coord_using_realsense
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for matplotlib
+import matplotlib.pyplot as plt
 
 # Note: convert_depth_to_phys_coord_using_orbbec is imported lazily in pixel2pose()
 # to allow the app to work even when pyorbbecsdk is not available (e.g., RealSense mode)
@@ -40,7 +44,14 @@ def find_min_segment(cx: int, cy: int, contour: np.ndarray) -> Tuple[Tuple[int, 
         if dist_sq < min_dist_sq:
             min_dist_sq = dist_sq
             result_points = (tuple(p1), tuple(p2))
-
+    
+    # Increase the distance between the two points by 10% to ensure they are not too close
+    p1, p2 = result_points
+    mid_point = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+    vector = (p2[0] - p1[0], p2[1] - p1[1])
+    new_p1 = (int(mid_point[0] - vector[0] * 0.55), int(mid_point[1] - vector[1] * 0.55))
+    new_p2 = (int(mid_point[0] + vector[0] * 0.55), int(mid_point[1] + vector[1] * 0.55))
+    result_points = (new_p1, new_p2)   
     return result_points
 
 
@@ -96,6 +107,30 @@ def pixel2pose(
         z2 = float(depth[int(y2), int(x2)].item())
         z2, x2, y2 = coord_converter(x2, y2, z2, depth_intrinsics, extrinsic)
 
+        if False:  # Debugging: Save depth values as heatmap
+            
+            frame_y_min, frame_x_min = cropper.cropped2orig(0, 0)
+            frame_y_max, frame_x_max = cropper.cropped2orig(DEFAULT_CAMERA_CONFIG.crop_height, DEFAULT_CAMERA_CONFIG.crop_width)
+            target_x_min = int(frame_x_min * coeff_width)
+            target_x_max = int(frame_x_max * coeff_width)
+            target_y_min = int(frame_y_min * coeff_height)
+            target_y_max = int(frame_y_max * coeff_height)
+            x_array = range(target_x_min, target_x_max, 1) #width or col
+            y_array = range(target_y_min, target_y_max, 1) #height or row
+            X, Y = np.meshgrid(x_array, y_array)
+        
+
+            Z = depth[Y,X]
+            Z = np.where(Z > 600, Z, 700)  # Replace outliers with median
+
+            #Save Z Z values as a heatmap for debugging
+            plt.imshow(Z, cmap='viridis')
+            plt.colorbar(label='Depth (mm)')
+            plt.title(f'Depth Heatmap')
+            plt.xlabel('X-axis (pixels)')
+            plt.ylabel('Y-axis (pixels)')
+            plt.savefig(f'depth_heatmap.png')
+            plt.clf()  # Clear the figure for the next heatmap
         if z1 != 0 and z2 != 0:
             message.append(
                 {

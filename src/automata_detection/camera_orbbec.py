@@ -61,6 +61,22 @@ class Parameters:
         self.color_width = _color_width
         self.color_height = _color_height
 
+
+def enhance_contrast(image, clip_limit=3.0, tile_grid_size=(8, 8)):
+    """
+    Enhance image contrast using CLAHE
+    """
+    if len(image.shape) == 3:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+        l = clahe.apply(l)
+        lab = cv2.merge((l, a, b))
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    else:
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+        return clahe.apply(image)
+    
 def convert_depth_to_phys_coord_using_orbbec(x: float, y: float, depth: float, depth_intrinsics, extrinsic) -> Tuple[float, float, float]:
     # x axis is frame width and y axis is height
     res = transformation2dto3d(OBPoint2f(x, y), depth, depth_intrinsics, extrinsic)
@@ -214,6 +230,7 @@ def read_camera(*, frame_queue, parameters_queue, width, height, verbose=False):
         depth = temporal_filter.process(depth_data)
         
         image = frame_to_bgr_image(color_frame)
+        image = enhance_contrast(image)
 
         if not frame_queue.full():
             frame_queue.put((image, depth))

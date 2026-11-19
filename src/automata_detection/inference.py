@@ -68,7 +68,7 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
         #canvas = np.ones_like(cv_image, dtype=np.uint8) * 255 #white background
 
         for contour in contours:
-            if contour.size < 200 or contour.size > 1500:
+            if contour.size < 180 or contour.size > 1500:
                 continue
 
             M = cv2.moments(contour)
@@ -88,12 +88,13 @@ def start_inference(*, frame_queue: Queue, parameters_queue: Queue, send_queue: 
             results.append({"1": segment_p1, "2": segment_p2})
 
         filtered_depth = cv2.medianBlur(depth, 5)  # Kernel size of 
+        filtered_depth = cv2.medianBlur(filtered_depth, 5)  # Kernel size of 
         message = pixel2pose(results, filtered_depth, coeff_height, coeff_width, camera_type=camera_type, depth_intrinsics=depth_intrinsics, extrinsic=extrinsic)
         if message:
             send_queue.put(message)
 
-        timestamp = int(time.time())
-        cv2.putText(cv_image, str(timestamp), (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+        # timestamp = int(time.time())
+        # cv2.putText(cv_image, str(timestamp), (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.imwrite("result.png", cv_image)
 
         if sleep > 0:
