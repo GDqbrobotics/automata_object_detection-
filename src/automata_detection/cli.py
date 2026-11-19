@@ -2,7 +2,6 @@ import argparse
 from multiprocessing import Process, Queue
 
 from .inference import start_inference
-from .mqtt import mqtt_send
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -15,7 +14,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port")
     parser.add_argument("--mqtt-user", type=str, default="mqtt", help="MQTT username")
     parser.add_argument("--mqtt-password", type=str, default="Vn370gi@lo#T", help="MQTT password")
-    parser.add_argument("--mqtt-send-topic", type=str, default="test_coordinate", help="MQTT topic for events")
+    parser.add_argument("--mqtt-status-topic", type=str, default="automata/subsystem/vision/status", help="MQTT topic for status updates")
+    parser.add_argument("--mqtt-results-topic", type=str, default="automata/subsystem/vision/response", help="MQTT topic for capture results")
+    parser.add_argument("--mqtt-command-topic", type=str, default="automata/subsystem/vision/event", help="MQTT topic for commands")
+    parser.add_argument("--capture-frames", type=int, default=10, help="Number of frames to capture for averaging")
     parser.add_argument("--inference-sleep", type=float, default=0.01, help="Sleep time between inference iterations")
     parser.add_argument("--verbose", action="store_true", help="Print detailed debug information")
 
@@ -40,7 +42,6 @@ def main() -> None:
 
     frame_queue = Queue(maxsize=1)
     parameters_queue = Queue(maxsize=1)
-    send_queue = Queue()
 
     read_process = Process(
         target=read_camera,
@@ -53,32 +54,41 @@ def main() -> None:
         },
     )
 
-    send_process = Process(
-        target=mqtt_send,
-        kwargs={
-            "topic": args.mqtt_send_topic,
-            "host": args.mqtt_host,
-            "port": args.mqtt_port,
-            "send_queue": send_queue,
-            "username": args.mqtt_user,
-            "password": args.mqtt_password,
-            "verbose": args.verbose,
-        },
-    )
-
     inference_process = Process(
         target=start_inference,
         kwargs={
             "frame_queue": frame_queue,
             "parameters_queue": parameters_queue,
-            "send_queue": send_queue,
+            "send_queue": None,  # Not used anymore - inference handles MQTT directly
             "verbose": args.verbose,
             "sleep": args.inference_sleep,
+            "depth_height": 720,
+            "depth_width": 1280,
             "camera_type": args.camera_type,
+            "mqtt_host": args.mqtt_host,
+            "mqtt_port": args.mqtt_port,
+            "mqtt_user": args.mqtt_user,
+            "mqtt_password": args.mqtt_password,
+            "mqtt_status_topic": args.mqtt_status_topic,
+            "mqtt_results_topic": args.mqtt_results_topic,
+            "mqtt_command_topic": args.mqtt_command_topic,
+            "capture_frames": args.capture_frames,
         },
     )
 
     read_process.start()
-    send_process.start()
     inference_process.start()
-    inference_process.join()
+    
+    try:
+        inference_process.join()
+    except KeyboardInterrupt:
+        print("[CLI] Shutting down...")
+    finally:
+        read_process.terminate()
+        read_process.join(timeout=2)
+        inference_process.terminate()
+        inference_process.join(timeout=2)
+
+
+if __name__ == "__main__":
+    main()
